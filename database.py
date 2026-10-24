@@ -77,6 +77,11 @@ class Store:
               action TEXT NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL
             );
             """)
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(users)")}
+            if "verified" not in columns:
+                c.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
+            if "pending_inviter_id" not in columns:
+                c.execute("ALTER TABLE users ADD COLUMN pending_inviter_id INTEGER")
 
     def upsert_user(self, user):
         ts = now_iso()
@@ -209,6 +214,53 @@ class Store:
         with self.connect() as c:
             if delete: c.execute("DELETE FROM required_chats WHERE chat_id=?", (str(chat_id),))
             elif enabled is not None: c.execute("UPDATE required_chats SET enabled=? WHERE chat_id=?", (int(enabled), str(chat_id)))
+
+    def set_pending_inviter(self, user_id, inviter_id):
+        if inviter_id == user_id:
+            return
+        with self.connect() as c:
+            c.execute("UPDATE users SET pending_inviter_id=? WHERE user_id=? AND verified=0 AND pending_inviter_id IS NULL",
+                      (inviter_id, user_id))
+
+    def user_verified(self, user_id):
+        row = self.get_user(user_id)
+        return bool(row and row["verified"])
+
+    def verify_user_and_reward(self, user_id):
+        with self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            user = c.execute("SELECT verified,pending_inviter_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+            if not user:
+                c.execute("ROLLBACK")
+                return False, None
+            if user["verified"]:
+                c.execute("COMMIT")
+                return False, None
+            inviter_id = user["pending_inviter_id"]
+            c.execute("UPDATE users SET verified=1,pending_inviter_id=NULL WHERE user_id=?", (user_id,))
+            rewarded = False
+            if inviter_id and inviter_id != user_id and c.execute("SELECT 1 FROM users WHERE user_id=?", (inviter_id,)).fetchone():
+                try:
+                    c.execute("INSERT INTO referrals(inviter_id,invitee_id,created_at) VALUES(?,?,?)", (inviter_id, user_id, now_iso()))
+                    row = c.execute("SELECT token_balance FROM users WHERE user_id=?", (inviter_id,)).fetchone()
+                    balance = row["token_balance"] + REWARD_TOKENS
+                    c.execute("UPDATE users SET token_balance=? WHERE user_id=?", (balance, inviter_id))
+                    c.execute("INSERT INTO referral_rewards(inviter_id,invitee_id,amount,created_at) VALUES(?,?,?,?)", (inviter_id, user_id, REWARD_TOKENS, now_iso()))
+                    c.execute("INSERT INTO token_transactions(user_id,amount,balance_after,reason,actor_id,created_at) VALUES(?,?,?,?,?,?)", (inviter_id, REWARD_TOKENS, balance, f"Verified referral for {user_id}", user_id, now_iso()))
+                    rewarded = True
+                except sqlite3.IntegrityError:
+                    rewarded = False
+            c.execute("COMMIT")
+            return True, inviter_id if rewarded else None
+
+    def update_required_chat(self, chat_id, title=None, invite_url=None):
+        with self.connect() as c:
+            row = c.execute("SELECT * FROM required_chats WHERE chat_id=?", (str(chat_id),)).fetchone()
+            if not row:
+                return False
+            c.execute("UPDATE required_chats SET title=?,invite_url=? WHERE chat_id=?",
+                      (title if title is not None else row["title"], invite_url if invite_url is not None else row["invite_url"], str(chat_id)))
+            return True
 
     def audit(self, admin_id, action, details):
         with self.connect() as c:

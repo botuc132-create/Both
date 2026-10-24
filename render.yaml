@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: zextron-free-key-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DB_PATH
+        value: /data/bot.db
+      - key: BOT_USERNAME
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1

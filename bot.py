@@ -62,19 +62,71 @@ def admin_keyboard():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user: return
+    if not user:
+        return
     is_new_user = store.get_user(user.id) is None
     store.upsert_user(user)
     args = context.args
     if is_new_user and args and args[0].startswith("ref_"):
-        try: inviter = int(args[0][4:])
-        except ValueError: inviter = 0
-        if inviter and inviter != user.id and store.reward_referral(inviter, user.id):
-            try: await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} Token vì có người mới tham gia qua liên kết giới thiệu!")
-            except TelegramError: pass
-    await update.effective_message.reply_text(
-        "✨ *KHO KEY TELEGRAM* ✨\n━━━━━━━━━━━━━━\nChọn chức năng bên dưới.\n\n🎁 Nhận key: {0} Token/key\n👥 Mời bạn bè: +{1} Token/lượt".format(KEY_COST, REWARD_TOKENS),
-        parse_mode="Markdown", reply_markup=main_keyboard(user.id))
+        try:
+            inviter = int(args[0][4:])
+        except ValueError:
+            inviter = 0
+        if inviter and inviter != user.id and store.get_user(inviter):
+            store.set_pending_inviter(user.id, inviter)
+    if is_admin(user.id):
+        await update.effective_message.reply_text(
+            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
+            parse_mode="Markdown", reply_markup=main_keyboard(user.id))
+        return
+    if store.user_verified(user.id):
+        await update.effective_message.reply_text(
+            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh thành công. Chọn chức năng bên dưới.",
+            parse_mode="Markdown", reply_markup=main_keyboard(user.id))
+        return
+    await send_join_gate(update.effective_message, context, user.id)
+
+async def send_join_gate(message, context, user_id):
+    chats = store.required_chats()
+    if not chats:
+        _, inviter = store.verify_user_and_reward(user_id)
+        await message.reply_text("✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChọn chức năng bên dưới.",
+                                 parse_mode="Markdown", reply_markup=main_keyboard(user_id))
+        if inviter:
+            try:
+                await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} Token vì người được mời đã xác minh!")
+            except TelegramError:
+                pass
+        return
+    buttons = [[InlineKeyboardButton(f"📢 JOIN CHANNEL {i}", url=chat["invite_url"])] for i, chat in enumerate(chats, 1)]
+    buttons.append([InlineKeyboardButton("✅ VERIFY", callback_data="verify_gate")])
+    await message.reply_text(
+        "🚫 *ACCESS DENIED!*\n\nYou must join our official channels to use this bot.\n\n👇 Join below and click ✅ *VERIFY*.",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+async def verify_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if is_admin(uid):
+        await q.message.reply_text("✅ Quản trị viên có thể sử dụng bot.", reply_markup=main_keyboard(uid))
+        return
+    missing, error = await required_check(uid, context)
+    if error:
+        await q.message.reply_text("⚠️ Không thể xác minh lúc này. Chưa mở khóa bot; hãy thử lại sau.")
+        return
+    if missing:
+        buttons = [[InlineKeyboardButton(f"📢 JOIN CHANNEL {i}", url=chat["invite_url"])] for i, chat in enumerate(missing, 1)]
+        buttons.append([InlineKeyboardButton("✅ VERIFY", callback_data="verify_gate")])
+        await q.message.reply_text("🚫 ACCESS DENIED! Bạn chưa tham gia đủ tất cả nhóm/kênh. Hãy tham gia rồi bấm VERIFY.", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    _, inviter = store.verify_user_and_reward(uid)
+    await q.message.reply_text("✅ XÁC MINH THÀNH CÔNG! Bạn đã được mở khóa bot.", reply_markup=main_keyboard(uid))
+    if inviter:
+        try:
+            await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} Token vì người được mời đã tham gia đủ kênh và xác minh thành công!")
+        except TelegramError:
+            pass
 
 async def show_referral(update, context):
     uid = update.effective_user.id
@@ -165,8 +217,25 @@ async def admin_callback(update, context):
         chats=store.required_chats(False)
         lines=["🔗 *NHÓM/KÊNH BẮT BUỘC*"]
         lines += [f"• {x['title']} — {'Bật' if x['enabled'] else 'Tắt'} (`{x['chat_id']}`)" for x in chats]
-        lines += ["\nQuản lý bằng lệnh:\n/addchat CHAT_ID | Tên | https://t.me/tenkenh\n/disablechat CHAT_ID\n/enablechat CHAT_ID\n/delchat CHAT_ID\n\nBot cần là thành viên và có quyền xem thành viên; với kênh nên cấp quyền quản trị."]
-        await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=admin_keyboard())
+        lines += ["\nChọn thao tác bên dưới. Bot phải được thêm vào nhóm/kênh; với kênh nên cấp quyền quản trị."]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Thêm nhóm/kênh", callback_data="adm:chat_add")],
+            [InlineKeyboardButton("✏️ Sửa tên/link", callback_data="adm:chat_edit")],
+            [InlineKeyboardButton("🗑 Xóa nhóm/kênh", callback_data="adm:chat_delete")],
+            [InlineKeyboardButton("🏠 Menu quản trị", callback_data="adm:back")]
+        ])
+        await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+    elif action == "adm:chat_add":
+        context.user_data["admin_state"] = "chat_add"
+        await q.edit_message_text("Gửi theo mẫu:\nCHAT_ID | Tên nhóm/kênh | https://t.me/link\n/cancel để hủy.")
+    elif action == "adm:chat_edit":
+        context.user_data["admin_state"] = "chat_edit"
+        await q.edit_message_text("Gửi theo mẫu:\nCHAT_ID | Tên mới | Link mới\n/cancel để hủy.")
+    elif action == "adm:chat_delete":
+        context.user_data["admin_state"] = "chat_delete"
+        await q.edit_message_text("Gửi CHAT_ID cần xóa khỏi danh sách bắt buộc. /cancel để hủy.")
+    elif action == "adm:back":
+        await q.edit_message_text("🛡 BẢNG QUẢN TRỊ", reply_markup=admin_keyboard())
     else:
         await q.edit_message_text("Chức năng không xác định.", reply_markup=admin_keyboard())
 
@@ -183,7 +252,29 @@ async def admin_text(update, context):
         context.user_data.clear()
         await update.effective_message.reply_text("⛔ Không có quyền."); return True
     text=update.effective_message.text or ""
-    if state == "addkeys":
+    if state == "chat_add":
+        parts = [x.strip() for x in text.split("|", 2)]
+        if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2].startswith(("https://t.me/", "https://telegram.me/")):
+            await update.effective_message.reply_text("Sai mẫu. Gửi: CHAT_ID | Tên | https://t.me/link")
+            return True
+        store.add_required_chat(parts[0], parts[1], parts[2], uid)
+        store.audit(uid, "add_required_chat", text)
+        await update.effective_message.reply_text("✅ Đã thêm nhóm/kênh bắt buộc.", reply_markup=admin_keyboard())
+    elif state == "chat_edit":
+        parts = [x.strip() for x in text.split("|", 2)]
+        if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2].startswith(("https://t.me/", "https://telegram.me/")):
+            await update.effective_message.reply_text("Sai mẫu. Gửi: CHAT_ID | Tên mới | https://t.me/link")
+            return True
+        if not store.update_required_chat(parts[0], parts[1], parts[2]):
+            await update.effective_message.reply_text("Không tìm thấy CHAT_ID này.")
+        else:
+            store.audit(uid, "edit_required_chat", text)
+            await update.effective_message.reply_text("✅ Đã cập nhật tên/link nhóm-kênh.", reply_markup=admin_keyboard())
+    elif state == "chat_delete":
+        store.chat_setting(text.strip(), delete=True)
+        store.audit(uid, "delete_required_chat", text.strip())
+        await update.effective_message.reply_text("🗑 Đã xóa nhóm/kênh khỏi danh sách bắt buộc.", reply_markup=admin_keyboard())
+    elif state == "addkeys":
         count=store.add_keys(text.splitlines(), uid)
         store.audit(uid,"add_keys",f"Added {count} keys")
         await update.effective_message.reply_text(f"✅ Đã thêm {count} key vào kho.", reply_markup=admin_keyboard())
@@ -280,6 +371,9 @@ async def text_router(update, context):
     text=update.effective_message.text or ""
     if await admin_text(update,context): return
     uid=update.effective_user.id
+    if not is_admin(uid) and not store.user_verified(uid):
+        await send_join_gate(update.effective_message, context, uid)
+        return
     if text == "🎁 Nhận key": await receive_key(update,context)
     elif text == "👥 Giới thiệu": await show_referral(update,context)
     elif text == "💰 Số dư Token":
@@ -294,6 +388,10 @@ async def text_router(update, context):
 async def check_join_callback(update, context):
     q=update.callback_query
     await q.answer()
+    if not is_admin(q.from_user.id) and not store.user_verified(q.from_user.id):
+        await q.message.reply_text("🚫 Bạn cần xác minh đầy đủ nhóm/kênh trước khi sử dụng bot.")
+        await send_join_gate(q.message, context, q.from_user.id)
+        return
     missing,error=await required_check(q.from_user.id,context)
     if error:
         await q.message.reply_text("⚠️ "+error); return
@@ -324,6 +422,7 @@ def build_application():
     app.add_handler(CommandHandler("cancel",cancel))
     for command in ("addchat","disablechat","enablechat","delchat"):
         app.add_handler(CommandHandler(command,chat_admin_command))
+    app.add_handler(CallbackQueryHandler(verify_gate_callback, pattern=r"^verify_gate$"))
     app.add_handler(CallbackQueryHandler(admin_callback,pattern=r"^(adm:|home$)"))
     app.add_handler(CallbackQueryHandler(check_join_callback,pattern=r"^checkjoin$"))
     app.add_handler(CallbackQueryHandler(broadcast_callback,pattern=r"^broadcast:"))
