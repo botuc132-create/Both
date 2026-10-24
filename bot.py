@@ -42,6 +42,7 @@ def main_keyboard(user_id):
     rows = [
         [KeyboardButton("🎁 Nhận key"), KeyboardButton("👥 Giới thiệu")],
         [KeyboardButton("💰 Số dư Token"), KeyboardButton("🗃 Kho key")],
+        [KeyboardButton("⬇️ Tải hack")],
         [KeyboardButton("ℹ️ Hướng dẫn")]
     ]
     if is_admin(user_id):
@@ -77,12 +78,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             store.set_pending_inviter(user.id, inviter)
     if is_admin(user.id):
         await update.effective_message.reply_text(
-            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
+            "✨ *SX2 TEAM FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
             parse_mode="Markdown", reply_markup=main_keyboard(user.id))
         return
     if store.user_verified(user.id):
         await update.effective_message.reply_text(
-            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh thành công. Chọn chức năng bên dưới.",
+            "✨ *SX2 TEAM FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh thành công. Chọn chức năng bên dưới.",
             parse_mode="Markdown", reply_markup=main_keyboard(user.id))
         return
     await send_join_gate(update.effective_message, context, user.id)
@@ -422,6 +423,11 @@ async def text_router(update, context):
     elif text == "🗃 Kho key":
         s=store.key_stats()
         await update.effective_message.reply_text(f"🗃 *TRẠNG THÁI KHO*\nKey còn: {s['available']}\nKey đã cấp: {s['claimed']}\nTổng: {s['total']}",parse_mode="Markdown",reply_markup=main_keyboard(uid))
+    elif text == "⬇️ Tải hack":
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Bấm vào đây ✅", url="https://link4sub.com/HRpFZdcmMs")]])
+        await update.effective_message.reply_text(
+            "⬇️ *TẢI HACK*\n\nBấm vào đây để tải:",
+            parse_mode="Markdown", reply_markup=kb)
     elif text == "🛡 Quản trị": await admin_command(update,context)
     elif text == "ℹ️ Hướng dẫn":
         await update.effective_message.reply_text(f"🎁 Nhận key: {KEY_COST} Token\n👥 Giới thiệu người mới: +{REWARD_TOKENS} Token\nDùng /start để mở menu.",reply_markup=main_keyboard(uid))
