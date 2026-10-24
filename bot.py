@@ -2,12 +2,13 @@ import logging
 import os
 import sqlite3
 import asyncio
+from aiohttp import web
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, CopyTextButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.constants import ChatMemberStatus
@@ -164,12 +165,14 @@ async def receive_key(update, context):
                                                   reply_markup=InlineKeyboardMarkup(buttons)); return
     ok, status, key = store.claim_key(uid)
     if ok:
-        await update.effective_message.reply_text(f"🎉 *NHẬN KEY THÀNH CÔNG*\n\n🔑 Key của bạn:\n`{key}`\n\n💸 Đã trừ {KEY_COST} Token. Số dư còn: {store.balance(uid)} Token",
-                                                  parse_mode="Markdown", reply_markup=main_keyboard(uid))
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép nhanh mã key", copy_text=CopyTextButton(text=key))]])
+        await update.effective_message.reply_text(
+            f"🎉 Chúc mừng bạn đã đổi key thành công!\n\n🔑 Mã key là: `{key}`\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\n\n💸 Đã trừ {KEY_COST} Token. Số dư còn: {store.balance(uid)} Token",
+            parse_mode="Markdown", reply_markup=kb)
     elif status == "INSUFFICIENT":
         await update.effective_message.reply_text(f"❌ Bạn cần {KEY_COST} Token để nhận key. Số dư hiện tại: {store.balance(uid)} Token.\nMời bạn bè để nhận thêm Token.", reply_markup=main_keyboard(uid))
     elif status == "EMPTY":
-        await update.effective_message.reply_text("📭 Kho đã hết key. Vui lòng quay lại sau.", reply_markup=main_keyboard(uid))
+        await update.effective_message.reply_text("📭 Hiện đang hết key. Vui lòng nhắn tin cho admin để thêm key: @huybuwin", reply_markup=main_keyboard(uid))
     else:
         await update.effective_message.reply_text("Không thể cấp key lúc này. Vui lòng thử lại.", reply_markup=main_keyboard(uid))
 
@@ -208,8 +211,8 @@ async def admin_callback(update, context):
         context.user_data["admin_state"] = "lookup"
         await q.edit_message_text("Gửi Telegram ID người dùng cần tra cứu. /cancel để hủy.")
     elif action == "adm:tokens":
-        context.user_data["admin_state"] = "tokens"
-        await q.edit_message_text("Gửi theo mẫu: USER_ID +50 hoặc USER_ID -20\nVí dụ: 123456789 +30")
+        context.user_data["admin_state"] = "tokens_user"
+        await q.edit_message_text("Nhập Telegram ID của người cần cộng/trừ Token. /cancel để hủy.")
     elif action == "adm:broadcast":
         context.user_data["admin_state"] = "broadcast"
         await q.edit_message_text("Gửi nội dung thông báo cho người đã /start bot. Sau đó bot sẽ yêu cầu xác nhận.\n/cancel để hủy.")
@@ -219,21 +222,32 @@ async def admin_callback(update, context):
         lines += [f"• {x['title']} — {'Bật' if x['enabled'] else 'Tắt'} (`{x['chat_id']}`)" for x in chats]
         lines += ["\nChọn thao tác bên dưới. Bot phải được thêm vào nhóm/kênh; với kênh nên cấp quyền quản trị."]
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Thêm nhóm/kênh", callback_data="adm:chat_add")],
-            [InlineKeyboardButton("✏️ Sửa tên/link", callback_data="adm:chat_edit")],
-            [InlineKeyboardButton("🗑 Xóa nhóm/kênh", callback_data="adm:chat_delete")],
+            [InlineKeyboardButton("➕ Thêm nhóm/kênh bằng link", callback_data="adm:chat_add")],
+            [InlineKeyboardButton("✏️ Sửa link nhóm/kênh", callback_data="adm:chat_edit")],
+            *[[InlineKeyboardButton("🗑 Xóa " + x["title"][:35], callback_data="adm:chat_del:" + x["chat_id"]) ] for x in chats if x["enabled"]],
             [InlineKeyboardButton("🏠 Menu quản trị", callback_data="adm:back")]
         ])
         await q.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
     elif action == "adm:chat_add":
-        context.user_data["admin_state"] = "chat_add"
-        await q.edit_message_text("Gửi theo mẫu:\nCHAT_ID | Tên nhóm/kênh | https://t.me/link\n/cancel để hủy.")
+        context.user_data["admin_state"] = "chat_add_link"
+        await q.edit_message_text("Gửi link công khai của nhóm/kênh, ví dụ https://t.me/tenkenh. Bot phải được thêm vào nhóm/kênh. /cancel để hủy.")
     elif action == "adm:chat_edit":
-        context.user_data["admin_state"] = "chat_edit"
-        await q.edit_message_text("Gửi theo mẫu:\nCHAT_ID | Tên mới | Link mới\n/cancel để hủy.")
-    elif action == "adm:chat_delete":
-        context.user_data["admin_state"] = "chat_delete"
-        await q.edit_message_text("Gửi CHAT_ID cần xóa khỏi danh sách bắt buộc. /cancel để hủy.")
+        chats = store.required_chats(False)
+        if not chats:
+            await q.edit_message_text("Danh sách nhóm/kênh đang trống.", reply_markup=admin_keyboard())
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(x["title"][:45], callback_data="adm:chat_edit_pick:" + x["chat_id"])] for x in chats] + [[InlineKeyboardButton("⬅️ Quay lại", callback_data="adm:chats")]])
+            await q.edit_message_text("Chọn nhóm/kênh cần đổi link:", reply_markup=kb)
+    elif action.startswith("adm:chat_del:"):
+        chat_id = action.split(":", 2)[2]
+        store.chat_setting(chat_id, delete=True)
+        store.audit(uid, "delete_required_chat", chat_id)
+        await q.edit_message_text("🗑 Đã xóa nhóm/kênh khỏi danh sách bắt buộc.", reply_markup=admin_keyboard())
+    elif action.startswith("adm:chat_edit_pick:"):
+        chat_id = action.split(":", 2)[2]
+        context.user_data["chat_edit_id"] = chat_id
+        context.user_data["admin_state"] = "chat_edit_link"
+        await q.edit_message_text("Gửi link mới cho nhóm/kênh đã chọn. Ví dụ https://t.me/tenkenh. /cancel để hủy.")
     elif action == "adm:back":
         await q.edit_message_text("🛡 BẢNG QUẢN TRỊ", reply_markup=admin_keyboard())
     else:
@@ -252,28 +266,40 @@ async def admin_text(update, context):
         context.user_data.clear()
         await update.effective_message.reply_text("⛔ Không có quyền."); return True
     text=update.effective_message.text or ""
-    if state == "chat_add":
-        parts = [x.strip() for x in text.split("|", 2)]
-        if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2].startswith(("https://t.me/", "https://telegram.me/")):
-            await update.effective_message.reply_text("Sai mẫu. Gửi: CHAT_ID | Tên | https://t.me/link")
+    if state == "chat_add_link":
+        link = text.strip()
+        import re
+        m = re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]{5,})/?", link)
+        if not m:
+            await update.effective_message.reply_text("Vui lòng gửi link công khai dạng https://t.me/tenkenh. Link mời riêng tư không thể tự tra cứu tên/ID qua Bot API.")
             return True
-        store.add_required_chat(parts[0], parts[1], parts[2], uid)
-        store.audit(uid, "add_required_chat", text)
-        await update.effective_message.reply_text("✅ Đã thêm nhóm/kênh bắt buộc.", reply_markup=admin_keyboard())
-    elif state == "chat_edit":
-        parts = [x.strip() for x in text.split("|", 2)]
-        if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2].startswith(("https://t.me/", "https://telegram.me/")):
-            await update.effective_message.reply_text("Sai mẫu. Gửi: CHAT_ID | Tên mới | https://t.me/link")
+        username = "@" + m.group(1)
+        try:
+            chat = await context.bot.get_chat(username)
+            store.add_required_chat(str(chat.id), chat.title or username, link, uid)
+            store.audit(uid, "add_required_chat", f"{chat.id}|{chat.title}|{link}")
+            await update.effective_message.reply_text(f"✅ Đã thêm: {chat.title or username}", reply_markup=admin_keyboard())
+        except TelegramError as e:
+            await update.effective_message.reply_text("Không lấy được thông tin chat. Hãy kiểm tra link và thêm bot vào nhóm/kênh trước. Với kênh, nên cấp quyền quản trị.")
             return True
-        if not store.update_required_chat(parts[0], parts[1], parts[2]):
-            await update.effective_message.reply_text("Không tìm thấy CHAT_ID này.")
-        else:
-            store.audit(uid, "edit_required_chat", text)
-            await update.effective_message.reply_text("✅ Đã cập nhật tên/link nhóm-kênh.", reply_markup=admin_keyboard())
-    elif state == "chat_delete":
-        store.chat_setting(text.strip(), delete=True)
-        store.audit(uid, "delete_required_chat", text.strip())
-        await update.effective_message.reply_text("🗑 Đã xóa nhóm/kênh khỏi danh sách bắt buộc.", reply_markup=admin_keyboard())
+    elif state == "chat_edit_link":
+        link = text.strip()
+        import re
+        m = re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]{5,})/?", link)
+        if not m:
+            await update.effective_message.reply_text("Gửi link công khai dạng https://t.me/tenkenh.")
+            return True
+        try:
+            chat = await context.bot.get_chat("@" + m.group(1))
+            chat_id = context.user_data.get("chat_edit_id")
+            if not store.update_required_chat(chat_id, title=chat.title or link, invite_url=link):
+                await update.effective_message.reply_text("Không tìm thấy nhóm/kênh đã chọn.")
+            else:
+                store.audit(uid, "edit_required_chat_link", f"{chat_id} -> {link}")
+                await update.effective_message.reply_text(f"✅ Đã cập nhật link: {chat.title or link}", reply_markup=admin_keyboard())
+        except TelegramError:
+            await update.effective_message.reply_text("Không xác minh được link mới. Hãy kiểm tra link và quyền của bot.")
+            return True
     elif state == "addkeys":
         count=store.add_keys(text.splitlines(), uid)
         store.audit(uid,"add_keys",f"Added {count} keys")
@@ -290,15 +316,30 @@ async def admin_text(update, context):
             tx_text="\n".join(f"• {x['amount']:+} → {x['balance_after']} Token: {x['reason']}" for x in txs) or "Chưa có giao dịch"
             await update.effective_message.reply_text(f"👤 ID: {target}\nTên: {u['first_name']}\nUsername: @{u['username'] or '-'}\nSố dư: {u['token_balance']} Token\nGiới thiệu: {refs}\n\n🔑 Key đã cấp gần đây:\n{claim_text}\n\n🪙 Giao dịch gần đây:\n{tx_text}")
         store.audit(uid,"lookup_user",str(target))
-    elif state == "tokens":
-        parts=text.split()
+    elif state == "tokens_user":
         try:
-            target=int(parts[0]); amount=int(parts[1])
-            balance=store.add_tokens(target, amount, "Admin adjustment", uid)
-            store.audit(uid,"adjust_tokens",f"user={target}, amount={amount}, balance={balance}")
-            await update.effective_message.reply_text(f"✅ Đã cập nhật số dư người dùng {target}: {balance} Token.")
-        except (ValueError, IndexError) as e:
-            await update.effective_message.reply_text(f"❌ Không thực hiện được: {e}\nMẫu: USER_ID +50 hoặc USER_ID -20")
+            target = int(text.strip())
+            if not store.get_user(target):
+                await update.effective_message.reply_text("Không tìm thấy người dùng đã /start bot. Nhập ID khác hoặc /cancel.")
+                return True
+            context.user_data["token_target_id"] = target
+            context.user_data["admin_state"] = "tokens_amount"
+            await update.effective_message.reply_text(f"Nhập số Token cho ID {target}. Dùng số dương để cộng, số âm để trừ. Ví dụ: 50 hoặc -30.")
+            return True
+        except ValueError:
+            await update.effective_message.reply_text("ID không hợp lệ. Hãy nhập Telegram ID dạng số hoặc /cancel.")
+            return True
+    elif state == "tokens_amount":
+        try:
+            amount = int(text.strip())
+            target = int(context.user_data.get("token_target_id"))
+            balance = store.add_tokens(target, amount, "Admin adjustment", uid)
+            store.audit(uid, "adjust_tokens", f"user={target}, amount={amount}, balance={balance}")
+            await update.effective_message.reply_text(f"✅ Đã {'cộng' if amount > 0 else 'trừ'} {abs(amount)} Token cho ID {target}. Số dư mới: {balance} Token.", reply_markup=admin_keyboard())
+            context.user_data.pop("token_target_id", None)
+        except (ValueError, TypeError) as e:
+            await update.effective_message.reply_text(f"❌ Không thực hiện được: {e}. Nhập số nguyên khác 0 hoặc /cancel.")
+            return True
     elif state == "broadcast":
         context.user_data["pending_broadcast"]=text
         context.user_data["admin_state"]="broadcast_confirm"
@@ -403,20 +444,42 @@ async def check_join_callback(update, context):
         # Re-run full claim checks only after membership is confirmed.
         ok,status,key=store.claim_key(q.from_user.id)
         if ok:
-            await q.message.reply_text(f"🎉 Key: `{key}`\nĐã trừ {KEY_COST} Token. Số dư: {store.balance(q.from_user.id)} Token",parse_mode="Markdown",reply_markup=main_keyboard(q.from_user.id))
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép nhanh mã key", copy_text=CopyTextButton(text=key))]])
+            await q.message.reply_text(f"🎉 Chúc mừng bạn đã đổi key thành công!\n\n🔑 Mã key là: `{key}`\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\n\n💸 Đã trừ {KEY_COST} Token. Số dư còn: {store.balance(q.from_user.id)} Token",parse_mode="Markdown",reply_markup=kb)
         elif status=="INSUFFICIENT":
             await q.message.reply_text(f"Bạn cần {KEY_COST} Token; hiện có {store.balance(q.from_user.id)}.")
         elif status=="EMPTY":
-            await q.message.reply_text("📭 Kho đã hết key.")
+            await q.message.reply_text("📭 Hiện đang hết key. Vui lòng nhắn tin cho admin để thêm key: @huybuwin")
         else: await q.message.reply_text("Không thể cấp key lúc này.")
 
 async def error_handler(update, context):
     log.exception("Unhandled exception", exc_info=context.error)
 
+async def health_handler(request):
+    return web.json_response({"status": "ok", "service": "telegram-bot"})
+
+async def start_health_server(application):
+    # Render Web Service health endpoint; this does not replace Telegram polling.
+    port = int(os.getenv("PORT", "10000"))
+    web_app = web.Application()
+    web_app.router.add_get("/", health_handler)
+    web_app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    application.bot_data["health_runner"] = runner
+    log.info("Health endpoint listening on port %s", port)
+
+async def stop_health_server(application):
+    runner = application.bot_data.get("health_runner")
+    if runner:
+        await runner.cleanup()
+
 def build_application():
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN environment variable")
-    app=Application.builder().token(BOT_TOKEN).build()
+    app=Application.builder().token(BOT_TOKEN).post_init(start_health_server).post_shutdown(stop_health_server).build()
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("admin",admin_command))
     app.add_handler(CommandHandler("cancel",cancel))
