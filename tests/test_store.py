@@ -26,6 +26,20 @@ class StoreTests(unittest.TestCase):
         with self.s.connect() as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM referrals").fetchone()[0],1)
 
+    def test_referral_reward_only_after_verification(self):
+        self.s.set_pending_inviter(2, 1)
+        self.assertEqual(self.s.balance(1), 0)
+        with self.s.connect() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM referrals").fetchone()[0], 0)
+        verified, inviter = self.s.verify_user_and_reward(2)
+        self.assertTrue(verified)
+        self.assertEqual(inviter, 1)
+        self.assertEqual(self.s.balance(1), REWARD_TOKENS)
+        verified_again, inviter_again = self.s.verify_user_and_reward(2)
+        self.assertFalse(verified_again)
+        self.assertIsNone(inviter_again)
+        self.assertEqual(self.s.balance(1), REWARD_TOKENS)
+
     def test_no_self_referral(self):
         self.assertFalse(self.s.reward_referral(1,1))
         self.assertEqual(self.s.balance(1),0)
