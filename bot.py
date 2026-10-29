@@ -12,6 +12,7 @@ from telegram import (
     ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.constants import ChatMemberStatus
+from telegram.helpers import escape_markdown
 from telegram.error import TelegramError, RetryAfter, Forbidden
 from database import Store, now_iso, REWARD_TOKENS, KEY_COST
 
@@ -74,6 +75,30 @@ with store.connect() as _conn:
     )""")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_key_requests_status ON key_requests(status, id)")
 
+DAILY_KEY_LIMIT = 3
+
+def vietnam_day_bounds():
+    """Return UTC ISO boundaries for the current Vietnam calendar day."""
+    from zoneinfo import ZoneInfo
+    now_local = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+    day_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = day_start_local.astimezone(timezone.utc).isoformat(timespec="seconds")
+    end_utc = (day_start_local + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
+    return start_utc, end_utc
+
+def daily_key_usage(user_id):
+    """Successful claims today plus pending requests created today reserve a slot."""
+    start_utc, end_utc = vietnam_day_bounds()
+    with store.connect() as conn:
+        claimed = conn.execute(
+            "SELECT COUNT(*) n FROM key_claims WHERE user_id=? AND created_at>=? AND created_at<?",
+            (user_id, start_utc, end_utc)
+        ).fetchone()["n"]
+        pending = conn.execute(
+            "SELECT COUNT(*) n FROM key_requests WHERE user_id=? AND status='pending' AND created_at>=? AND created_at<?",
+            (user_id, start_utc, end_utc)
+        ).fetchone()["n"]
+    return int(claimed) + int(pending)
 
 def get_invite_count(user_id):
     """Count only real successful referrals; no admin-set invite adjustments."""
@@ -101,7 +126,7 @@ def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Thêm key", callback_data="adm:addkeys"),
          InlineKeyboardButton("📦 Thống kê kho", callback_data="adm:keys")],
-        [InlineKeyboardButton("👤 Tổng người dùng", callback_data="adm:users"),
+        [InlineKeyboardButton("👥 Danh sách người dùng", callback_data="adm:users:0"),
          InlineKeyboardButton("🔎 Tra cứu ID", callback_data="adm:lookup")],
         [InlineKeyboardButton("🪙 Cộng/trừ điểm", callback_data="adm:tokens"),
          InlineKeyboardButton("📣 Phát thông báo", callback_data="adm:broadcast")],
@@ -255,6 +280,15 @@ def create_key_request(user_id):
         return True, "PENDING", {"request_id": cur.lastrowid, "key_id": key["id"], "key_text": key["key_text"], "balance": balance, "created_at": ts}
 
 async def request_key_approval(message, context, user_id):
+    # Admin accounts are exempt from the daily limit.
+    if not is_admin(user_id):
+        used_today = daily_key_usage(user_id)
+        if used_today >= DAILY_KEY_LIMIT:
+            await message.reply_text(
+                "😝 Lượt đổi key đã hết, đổi key vào ngày mai nhé ngày chỉ được 3 lượt hoii!!!",
+                reply_markup=main_keyboard(user_id)
+            )
+            return
     ok, status, data = await asyncio.to_thread(create_key_request, user_id)
     if not ok:
         if status == "INSUFFICIENT":
@@ -304,6 +338,38 @@ async def admin_command(update, context):
     store.audit(uid, "open_admin", "Opened admin menu")
     await update.effective_message.reply_text("🛡 *BẢNG QUẢN TRỊ*\nChọn chức năng:", parse_mode="Markdown", reply_markup=admin_keyboard())
 
+async def show_users_page(query, page=0):
+    """Display registered users in pages with username/ID, balance and invite count."""
+    page_size = 10
+    with store.connect() as conn:
+        total = int(conn.execute("SELECT COUNT(*) n FROM users").fetchone()["n"])
+        pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(int(page), pages - 1))
+        rows = conn.execute("""SELECT u.user_id, u.username, u.first_name, u.token_balance,
+                    (SELECT COUNT(*) FROM referrals r WHERE r.inviter_id=u.user_id) AS invite_count
+                    FROM users u ORDER BY u.started_at ASC, u.user_id ASC LIMIT ? OFFSET ?""",
+                    (page_size, page * page_size)).fetchall()
+    lines = [f"👥 DANH SÁCH NGƯỜI DÙNG", f"Tổng: {total} | Trang {page + 1}/{pages}", "━━━━━━━━━━━━━━━━━━"]
+    buttons = []
+    for row in rows:
+        raw_label = "@" + row["username"] if row["username"] else f"ID {row['user_id']}"
+        label = escape_markdown(raw_label, version=1)
+        name = escape_markdown(((row["first_name"] or "Chưa có tên").replace("\n", " ")[:45]), version=1)
+        lines.append(f"{label} — {name}\n🆔 `{row['user_id']}` | 💰 {row['token_balance']} điểm | 👥 {row['invite_count']} lượt mời")
+        buttons.append([InlineKeyboardButton(f"🔎 {raw_label}"[:60], callback_data=f"admuser:refresh:{row['user_id']}")])
+    if not rows:
+        lines.append("Chưa có người dùng nào.")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Trang trước", callback_data=f"adm:users:{page - 1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton("Trang sau ➡️", callback_data=f"adm:users:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🏠 Menu quản trị", callback_data="adm:back")])
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+
 async def admin_callback(update, context):
     q = update.callback_query
     await q.answer()
@@ -316,8 +382,12 @@ async def admin_callback(update, context):
     elif action == "adm:keys":
         s = store.key_stats()
         await q.edit_message_text(f"📦 *KHO KEY*\nTổng: {s['total']}\nCòn: {s['available']}\nĐã cấp: {s['claimed']}", parse_mode="Markdown", reply_markup=admin_keyboard())
-    elif action == "adm:users":
-        await q.edit_message_text(f"👤 Tổng người dùng đã /start: {store.users_count()}", reply_markup=admin_keyboard())
+    elif action == "adm:users" or action.startswith("adm:users:"):
+        try:
+            page = max(0, int(action.split(":", 2)[2])) if action.count(":") >= 2 else 0
+        except ValueError:
+            page = 0
+        await show_users_page(q, page)
     elif action == "adm:stats":
         s=store.key_stats()
         with store.connect() as c:
@@ -605,6 +675,8 @@ async def text_router(update, context):
         end_utc = (now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
         with store.connect() as conn:
             today_invites = conn.execute("SELECT COUNT(*) n FROM referrals WHERE inviter_id=? AND created_at>=? AND created_at<?", (uid, start_utc, end_utc)).fetchone()["n"]
+        key_uses_today = daily_key_usage(uid)
+        key_uses_left = max(0, DAILY_KEY_LIMIT - key_uses_today)
         balance = store.balance(uid)
         balance_text = (
             "╭━━━ ✨ *THÔNG TIN ĐIỂM* ✨ ━━━╮\n"
@@ -615,6 +687,8 @@ async def text_router(update, context):
             "👥 *THỐNG KÊ GIỚI THIỆU*\n"
             f"🏆 Tổng lượt mời: *{total_invites}*\n"
             f"📅 Lượt mời hôm nay: *{today_invites}*\n"
+            f"🔑 Lượt đổi key hôm nay: *{min(key_uses_today, DAILY_KEY_LIMIT)}/{DAILY_KEY_LIMIT}*\n"
+            f"🎟️ Lượt đổi key còn hôm nay: *{key_uses_left}/{DAILY_KEY_LIMIT}*\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🎁 Mời bạn bè tham gia để tích lũy thêm điểm nhé!\n"
             "╰━━━━━━━━━━━━━━━━━━╯"
@@ -738,9 +812,11 @@ async def key_request_callback(update, context):
         conn.execute("COMMIT")
     store.audit(q.from_user.id, "approve_key_request", f"request={request_id}; user={req['user_id']}")
     balance = store.balance(req["user_id"])
+    used_today = daily_key_usage(req["user_id"])
+    remaining_today = max(0, DAILY_KEY_LIMIT - used_today)
     try:
         await context.bot.send_message(req["user_id"],
-            f"🎉 Chúc mừng bạn đã được admin duyệt key thành công!\n\n🔑 Mã key là: {key['key_text']}\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\nSố điểm còn: {balance} điểm",
+            f"🎉 Chúc mừng bạn đã được admin duyệt key thành công!\n\n🔑 Mã key là: {key['key_text']}\n\n📊 Lượt đổi key hôm nay: {min(used_today, DAILY_KEY_LIMIT)}/{DAILY_KEY_LIMIT}\n🎟️ Lượt đổi key còn hôm nay: {remaining_today}/{DAILY_KEY_LIMIT}\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\nSố điểm còn: {balance} điểm",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép nhanh mã key", copy_text=CopyTextButton(text=key["key_text"]))]]))
         await q.message.reply_text(f"✅ Đã duyệt yêu cầu #{request_id} cho ID {req['user_id']}.")
     except TelegramError:
