@@ -34,15 +34,30 @@ BROADCAST_DELAY = 0.05
 
 
 store = Store()
+# Key requests wait for admin approval; points are held until the request is decided.
+with store.connect() as _conn:
+    _conn.execute("""CREATE TABLE IF NOT EXISTS key_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        key_id INTEGER NOT NULL,
+        cost INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        decided_by INTEGER,
+        reject_reason TEXT
+    )""")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_key_requests_status ON key_requests(status, id)")
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 def main_keyboard(user_id):
     rows = [
-        [KeyboardButton("🔑 Đổi key"), KeyboardButton("👥 Giới thiệu")],
+        [KeyboardButton("🔑 Đổi key")],
         [KeyboardButton("💰 Số dư điểm"), KeyboardButton("🗃 Kho key")],
-        [KeyboardButton("📨 Mời bạn bè"), KeyboardButton("🆘 Hỗ trợ")]
+        [KeyboardButton("📨 Mời bạn bè"), KeyboardButton("🏆 Top 5 người mời")],
+        [KeyboardButton("🆘 Hỗ trợ")]
     ]
     if is_admin(user_id):
         rows.append([KeyboardButton("🛡 Quản trị")])
@@ -173,6 +188,70 @@ async def required_check(user_id, context):
             return None, "Không thể xác minh tư cách thành viên hiện tại. Vui lòng thử lại sau; key chưa được cấp."
     return missing, None
 
+def create_key_request(user_id):
+    """Reserve an available key and hold the points until admin decides."""
+    with store.connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        user = c.execute("SELECT token_balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not user:
+            c.execute("ROLLBACK")
+            return False, "USER_NOT_FOUND", None
+        if user["token_balance"] < KEY_COST:
+            c.execute("ROLLBACK")
+            return False, "INSUFFICIENT", None
+        pending = c.execute("SELECT id FROM key_requests WHERE user_id=? AND status='pending' LIMIT 1", (user_id,)).fetchone()
+        if pending:
+            c.execute("ROLLBACK")
+            return False, "PENDING_EXISTS", None
+        key = c.execute("""SELECT k.id,k.key_text FROM keys k
+            WHERE k.claimed_at IS NULL AND NOT EXISTS (
+                SELECT 1 FROM key_requests r WHERE r.key_id=k.id AND r.status='pending'
+            ) ORDER BY k.id LIMIT 1""").fetchone()
+        if not key:
+            c.execute("ROLLBACK")
+            return False, "EMPTY", None
+        balance = int(user["token_balance"]) - KEY_COST
+        ts = now_iso()
+        c.execute("UPDATE users SET token_balance=? WHERE user_id=?", (balance, user_id))
+        cur = c.execute("INSERT INTO key_requests(user_id,key_id,cost,status,created_at) VALUES(?,?,?,'pending',?)",
+                        (user_id, key["id"], KEY_COST, ts))
+        c.execute("INSERT INTO token_transactions(user_id,amount,balance_after,reason,actor_id,created_at) VALUES(?,?,?,?,?,?)",
+                  (user_id, -KEY_COST, balance, "Hold points for pending key approval", None, ts))
+        c.execute("COMMIT")
+        return True, "PENDING", {"request_id": cur.lastrowid, "key_id": key["id"], "key_text": key["key_text"], "balance": balance, "created_at": ts}
+
+async def request_key_approval(message, context, user_id):
+    ok, status, data = await asyncio.to_thread(create_key_request, user_id)
+    if not ok:
+        if status == "INSUFFICIENT":
+            balance = store.balance(user_id)
+            missing_points = max(0, KEY_COST - balance)
+            people_needed = (missing_points + REWARD_TOKENS - 1) // REWARD_TOKENS
+            await message.reply_text(f"❌ Bạn còn thiếu {missing_points} điểm nữa để có thể đổi key.\nHãy mời thêm {people_needed} người nữa để nhận đủ điểm nhé!", reply_markup=main_keyboard(user_id))
+        elif status == "EMPTY":
+            await message.reply_text("📭 Hiện đang hết key. Vui lòng nhắn tin cho admin để thêm key: @huybuwin", reply_markup=main_keyboard(user_id))
+        elif status == "PENDING_EXISTS":
+            await message.reply_text("⏳ Bạn đang có một yêu cầu đổi key chờ admin duyệt. Vui lòng đợi kết quả trước khi gửi yêu cầu mới.", reply_markup=main_keyboard(user_id))
+        else:
+            await message.reply_text("Không thể gửi yêu cầu đổi key lúc này.", reply_markup=main_keyboard(user_id))
+        return
+    await message.reply_text("✅ Đổi key thành công vui lòng đợi admin xét duyệt số điểm sẽ bị tạm giữ nếu thấy lâu quá hãy nhắn @huybuwin để hỏi !!", reply_markup=main_keyboard(user_id))
+    from zoneinfo import ZoneInfo
+    vn_time = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%H:%M %d/%m/%Y")
+    user = store.get_user(user_id)
+    uname = f"@{user['username']}" if user and user['username'] else "(chưa có username)"
+    admin_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Duyệt", callback_data=f"keyreq:approve:{data['request_id']}"),
+        InlineKeyboardButton("❌ Từ chối", callback_data=f"keyreq:reject:{data['request_id']}")
+    ]])
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id,
+                f"📥 YÊU CẦU ĐỔI KEY\nNgười dùng {uname} ID {user_id}\nĐã đổi key lúc {vn_time} giờ Việt Nam.\nYêu cầu #{data['request_id']} — điểm đang tạm giữ: {KEY_COST} điểm.",
+                reply_markup=admin_kb)
+        except TelegramError:
+            log.exception("Could not notify admin %s about key request", admin_id)
+
 async def receive_key(update, context):
     uid = update.effective_user.id
     missing, error = await required_check(uid, context)
@@ -181,25 +260,8 @@ async def receive_key(update, context):
     if missing:
         buttons = [[InlineKeyboardButton("➕ " + c["title"][:45], url=c["invite_url"])] for c in missing]
         buttons.append([InlineKeyboardButton("🔄 Tôi đã tham gia — kiểm tra lại", callback_data="checkjoin")])
-        await update.effective_message.reply_text("🔒 Bạn cần tham gia đầy đủ nhóm/kênh bên dưới trước khi nhận key:",
-                                                  reply_markup=InlineKeyboardMarkup(buttons)); return
-    ok, status, key = store.claim_key(uid)
-    if ok:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép nhanh mã key", copy_text=CopyTextButton(text=key))]])
-        await update.effective_message.reply_text(
-            f"🎉 Chúc mừng bạn đã đổi key thành công!\n\n🔑 Mã key là: `{key}`\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\n\n💸 Đã trừ {KEY_COST} điểm. Số dư còn: {store.balance(uid)} điểm",
-            parse_mode="Markdown", reply_markup=kb)
-    elif status == "INSUFFICIENT":
-        balance = store.balance(uid)
-        missing_points = max(0, KEY_COST - balance)
-        people_needed = (missing_points + REWARD_TOKENS - 1) // REWARD_TOKENS
-        await update.effective_message.reply_text(
-            f"❌ Bạn còn thiếu {missing_points} điểm nữa để có thể đổi key.\nHãy mời thêm {people_needed} người nữa để nhận đủ điểm nhé!",
-            reply_markup=main_keyboard(uid))
-    elif status == "EMPTY":
-        await update.effective_message.reply_text("📭 Hiện đang hết key. Vui lòng nhắn tin cho admin để thêm key: @huybuwin", reply_markup=main_keyboard(uid))
-    else:
-        await update.effective_message.reply_text("Không thể cấp key lúc này. Vui lòng thử lại.", reply_markup=main_keyboard(uid))
+        await update.effective_message.reply_text("🔒 Bạn cần tham gia đầy đủ nhóm/kênh bên dưới trước khi đổi key:", reply_markup=InlineKeyboardMarkup(buttons)); return
+    await request_key_approval(update.effective_message, context, uid)
 
 async def admin_command(update, context):
     uid = update.effective_user.id
@@ -234,7 +296,7 @@ async def admin_callback(update, context):
         await q.edit_message_text("Gửi các key, mỗi dòng một bản ghi. Dòng trùng vẫn được lưu riêng.\nGõ /cancel để hủy.")
     elif action == "adm:lookup":
         context.user_data["admin_state"] = "lookup"
-        await q.edit_message_text("Gửi Telegram ID người dùng cần tra cứu. /cancel để hủy.")
+        await q.edit_message_text("Gửi Telegram ID người dùng cần kiểm tra. /cancel để hủy.")
     elif action == "adm:tokens":
         context.user_data["admin_state"] = "tokens_user"
         await q.edit_message_text("Nhập Telegram ID của người cần cộng/trừ điểm. /cancel để hủy.")
@@ -281,6 +343,7 @@ async def admin_callback(update, context):
 async def cancel(update, context):
     context.user_data.pop("admin_state", None)
     context.user_data.pop("pending_broadcast", None)
+    context.user_data.pop("reject_key_request_id", None)
     await update.effective_message.reply_text("Đã hủy thao tác.", reply_markup=main_keyboard(update.effective_user.id))
 
 async def admin_text(update, context):
@@ -333,14 +396,28 @@ async def admin_text(update, context):
         try: target=int(text.strip())
         except ValueError:
             await update.effective_message.reply_text("ID không hợp lệ. Gửi số Telegram ID hoặc /cancel."); return True
-        d=store.user_details(target)
-        if not d: await update.effective_message.reply_text("Không tìm thấy người dùng đã bắt đầu bot.")
+        if not store.user_details(target):
+            await update.effective_message.reply_text("Không tìm thấy người dùng đã bắt đầu bot.")
         else:
-            u, refs, claims, txs=d
-            claim_text="\n".join(f"• {x['key_text']} ({x['claimed_at']})" for x in claims) or "Chưa nhận key"
-            tx_text="\n".join(f"• {x['amount']:+} → {x['balance_after']} điểm: {x['reason']}" for x in txs) or "Chưa có giao dịch"
-            await update.effective_message.reply_text(f"👤 ID: {target}\nTên: {u['first_name']}\nUsername: @{u['username'] or '-'}\nSố dư: {u['token_balance']} điểm\nGiới thiệu: {refs}\n\n🔑 Key đã cấp gần đây:\n{claim_text}\n\n🪙 Giao dịch gần đây:\n{tx_text}")
+            await send_account_card(update.effective_message, target)
         store.audit(uid,"lookup_user",str(target))
+    elif state in ("account_add_amount", "account_sub_amount"):
+        try:
+            amount = int(text.strip())
+            if amount <= 0:
+                raise ValueError("Hãy nhập số điểm lớn hơn 0.")
+            target = int(context.user_data["account_target_id"])
+            signed_amount = amount if state == "account_add_amount" else -amount
+            balance = store.add_tokens(target, signed_amount, "Admin account check adjustment", uid)
+            store.audit(uid, "adjust_tokens", f"user={target}, amount={signed_amount}, balance={balance}")
+            context.user_data.pop("account_target_id", None)
+            context.user_data.pop("admin_state", None)
+            await update.effective_message.reply_text(f"✅ Đã {'cộng' if signed_amount > 0 else 'trừ'} {amount} điểm. Số dư mới: {balance} điểm.")
+            await send_account_card(update.effective_message, target)
+            return True
+        except (ValueError, TypeError, KeyError) as e:
+            await update.effective_message.reply_text(f"Số điểm không hợp lệ: {e}. Hãy gửi số nguyên dương hoặc /cancel.")
+            return True
     elif state == "tokens_user":
         try:
             target = int(text.strip())
@@ -365,6 +442,36 @@ async def admin_text(update, context):
         except (ValueError, TypeError) as e:
             await update.effective_message.reply_text(f"❌ Không thực hiện được: {e}. Nhập số nguyên khác 0 hoặc /cancel.")
             return True
+    elif state == "key_reject_reason":
+        reason = text.strip()
+        if not reason:
+            await update.effective_message.reply_text("Vui lòng nhập lý do từ chối hoặc /cancel.")
+            return True
+        request_id = context.user_data.get("reject_key_request_id")
+        with store.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            req = conn.execute("SELECT * FROM key_requests WHERE id=?", (request_id,)).fetchone()
+            if not req or req["status"] != "pending":
+                conn.execute("ROLLBACK")
+                await update.effective_message.reply_text("Yêu cầu không còn ở trạng thái chờ duyệt.")
+                context.user_data.pop("reject_key_request_id", None)
+                context.user_data.pop("admin_state", None)
+                return True
+            user = conn.execute("SELECT token_balance FROM users WHERE user_id=?", (req["user_id"],)).fetchone()
+            new_balance = int(user["token_balance"]) + int(req["cost"])
+            conn.execute("UPDATE users SET token_balance=? WHERE user_id=?", (new_balance, req["user_id"]))
+            conn.execute("INSERT INTO token_transactions(user_id,amount,balance_after,reason,actor_id,created_at) VALUES(?,?,?,?,?,?)",
+                         (req["user_id"], req["cost"], new_balance, "Refund: key request rejected", uid, now_iso()))
+            conn.execute("UPDATE key_requests SET status='rejected',decided_at=?,decided_by=?,reject_reason=? WHERE id=?",
+                         (now_iso(), uid, reason[:1000], request_id))
+            conn.execute("COMMIT")
+        store.audit(uid, "reject_key_request", f"request={request_id}; reason={reason}")
+        try:
+            await context.bot.send_message(req["user_id"], f"❌ Yêu cầu đổi key của bạn đã bị từ chối. Lý do: {reason}\n\nSố điểm đã được hoàn lại: {req['cost']} điểm. Số dư hiện tại: {new_balance} điểm.")
+        except TelegramError:
+            pass
+        await update.effective_message.reply_text(f"❌ Đã từ chối yêu cầu #{request_id}; đã hoàn {req['cost']} điểm cho người dùng.", reply_markup=admin_keyboard())
+        context.user_data.pop("reject_key_request_id", None)
     elif state == "broadcast":
         context.user_data["pending_broadcast"]=text
         context.user_data["admin_state"]="broadcast_confirm"
@@ -453,7 +560,6 @@ async def text_router(update, context):
                 except TelegramError:
                     pass
     if text == "🔑 Đổi key": await receive_key(update,context)
-    elif text == "👥 Giới thiệu": await show_referral(update,context)
     elif text == "💰 Số dư điểm":
         details = store.user_details(uid)
         total_invites = int(details[1]) if details else 0
@@ -465,32 +571,145 @@ async def text_router(update, context):
         end_utc = (now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
         with store.connect() as conn:
             today_invites = conn.execute("SELECT COUNT(*) n FROM referrals WHERE inviter_id=? AND created_at>=? AND created_at<?", (uid, start_utc, end_utc)).fetchone()["n"]
+        balance = store.balance(uid)
         balance_text = (
-            f"Số điểm của bạn có: {store.balance(uid)}\n"
-            f"ID người dùng: `{uid}`\n"
-            "-----------------\n"
-            f"Tổng lượt mời: {total_invites}\n"
-            f"Lượt mời hôm nay: {today_invites}\n"
-            "------------------"
+            "╭━━━ ✨ *THÔNG TIN ĐIỂM* ✨ ━━━╮\n"
+            f"💎 *Số điểm hiện có*\n"
+            f"　└ 💰 *{balance:,} điểm*\n\n"
+            f"🪪 *ID người dùng:* `{uid}`\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "👥 *THỐNG KÊ GIỚI THIỆU*\n"
+            f"🏆 Tổng lượt mời: *{total_invites}*\n"
+            f"📅 Lượt mời hôm nay: *{today_invites}*\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🎁 Mời bạn bè tham gia để tích lũy thêm điểm nhé!\n"
+            "╰━━━━━━━━━━━━━━━━━━╯"
         )
-        copy_id_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📋 Sao chép ID", copy_text=CopyTextButton(text=str(uid)))
-        ]])
+        copy_id_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Sao chép ID", copy_text=CopyTextButton(text=str(uid)))],
+            [InlineKeyboardButton("📨 Mời bạn bè", callback_data="balance:invite")]
+        ])
         await update.effective_message.reply_text(
             balance_text,
             parse_mode="Markdown",
             reply_markup=copy_id_kb
         )
     elif text == "🗃 Kho key":
-        s=store.key_stats()
-        await update.effective_message.reply_text(f"🗃 *TRẠNG THÁI KHO*\nKey còn: {s['available']}\nKey đã cấp: {s['claimed']}\nTổng: {s['total']}",parse_mode="Markdown",reply_markup=main_keyboard(uid))
+        s = store.key_stats()
+        with store.connect() as conn:
+            reserved_keys = conn.execute("SELECT COUNT(*) n FROM key_requests WHERE status='pending'").fetchone()["n"]
+        s["available"] = max(0, s["available"] - reserved_keys)
+        from zoneinfo import ZoneInfo
+        now_local = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+        day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat(timespec="seconds")
+        day_end = (now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
+        with store.connect() as conn:
+            today_claims = conn.execute("SELECT COUNT(*) n FROM key_claims WHERE created_at>=? AND created_at<?", (day_start, day_end)).fetchone()["n"]
+        await update.effective_message.reply_text(
+            "----------------------\n"
+            f"Kho key còn: {s['available']}\n\n"
+            f"Lượt đổi key hôm nay: {today_claims}\n\n"
+            "Mời bạn bè để nhận key ngay nhé 😍\n\n"
+            "-----------------------", reply_markup=main_keyboard(uid))
     elif text == "📨 Mời bạn bè":
         username = BOT_USERNAME or (await context.bot.get_me()).username
         link = f"https://t.me/{username}?start=ref_{uid}"
-        await update.effective_message.reply_text(f"🔗 Link mời bạn bè của bạn:\n{link}\n\nMỗi người mới hợp lệ tham gia đủ nhóm và xác minh sẽ giúp bạn nhận {REWARD_TOKENS} điểm.", reply_markup=main_keyboard(uid))
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép link mời", copy_text=CopyTextButton(text=link))]])
+        await update.effective_message.reply_text(
+            f"🔗 Link mời riêng của bạn:\n{link}\n\nBấm nút bên dưới để sao chép link. Mỗi người mới hợp lệ tham gia đủ nhóm và xác minh sẽ giúp bạn nhận {REWARD_TOKENS} điểm.",
+            reply_markup=kb)
+    elif text == "🏆 Top 5 người mời":
+        await show_top_invites(update.effective_message)
     elif text == "🆘 Hỗ trợ":
         await update.effective_message.reply_text("Liên hệ vào thẳng vấn đề", reply_markup=main_keyboard(uid))
     elif text == "🛡 Quản trị": await admin_command(update,context)
+
+
+async def show_top_invites(message):
+    with store.connect() as conn:
+        rows = conn.execute("""SELECT u.user_id,u.username,u.first_name,COUNT(r.id) AS invite_count
+            FROM users u LEFT JOIN referrals r ON r.inviter_id=u.user_id
+            GROUP BY u.user_id ORDER BY invite_count DESC, u.user_id ASC LIMIT 5""").fetchall()
+    lines = []
+    for i in range(5):
+        lines.append("------------------")
+        if i < len(rows):
+            row = rows[i]
+            name = f"@{row['username']}" if row['username'] else (row['first_name'] or f"ID {row['user_id']}")
+            lines.append(f"Top {i+1}: {name} ({row['invite_count']} người mời)")
+        else:
+            lines.append(f"Top {i+1}: Chưa có dữ liệu (0 người mời)")
+    lines.append("------------------")
+    await message.reply_text("🏆 TOP 5 NGƯỜI MỜI NHIỀU NHẤT\n" + "\n".join(lines))
+
+async def balance_quick_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if q.data == "balance:invite":
+        username = BOT_USERNAME or (await context.bot.get_me()).username
+        link = f"https://t.me/{username}?start=ref_{uid}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép link mời", copy_text=CopyTextButton(text=link))]])
+        await q.message.reply_text(
+            f"📨 *LINK MỜI RIÊNG CỦA BẠN*\n\n`{link}`\n\nBấm nút bên dưới để sao chép link.",
+            parse_mode="Markdown", reply_markup=kb)
+
+
+async def key_request_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        await q.message.reply_text("⛔ Bạn không có quyền quản trị.")
+        return
+    try:
+        _, decision, request_id_text = q.data.split(":", 2)
+        request_id = int(request_id_text)
+    except (ValueError, AttributeError):
+        await q.message.reply_text("Yêu cầu không hợp lệ.")
+        return
+    with store.connect() as conn:
+        req = conn.execute("SELECT * FROM key_requests WHERE id=?", (request_id,)).fetchone()
+    if not req:
+        await q.message.reply_text("Không tìm thấy yêu cầu này.")
+        return
+    if req["status"] != "pending":
+        await q.message.reply_text(f"Yêu cầu này đã được xử lý: {req['status']}.")
+        return
+    if decision == "reject":
+        context.user_data["reject_key_request_id"] = request_id
+        context.user_data["admin_state"] = "key_reject_reason"
+        await q.message.reply_text(f"Nhập lý do từ chối yêu cầu đổi key #{request_id}. Lý do này sẽ được gửi cho người dùng. Gõ /cancel để hủy.")
+        return
+    if decision != "approve":
+        await q.message.reply_text("Thao tác không hợp lệ.")
+        return
+    from zoneinfo import ZoneInfo
+    ts = now_iso()
+    with store.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute("SELECT * FROM key_requests WHERE id=?", (request_id,)).fetchone()
+        if not current or current["status"] != "pending":
+            conn.execute("ROLLBACK")
+            await q.message.reply_text("Yêu cầu đã được xử lý bởi thao tác khác.")
+            return
+        key = conn.execute("SELECT key_text,claimed_at FROM keys WHERE id=?", (current["key_id"],)).fetchone()
+        if not key or key["claimed_at"] is not None:
+            conn.execute("ROLLBACK")
+            await q.message.reply_text("Key không còn khả dụng; yêu cầu chưa được duyệt.")
+            return
+        conn.execute("UPDATE keys SET claimed_by=?,claimed_at=? WHERE id=?", (current["user_id"], ts, current["key_id"]))
+        conn.execute("INSERT INTO key_claims(key_id,user_id,cost,created_at) VALUES(?,?,?,?)", (current["key_id"], current["user_id"], current["cost"], ts))
+        conn.execute("UPDATE key_requests SET status='approved',decided_at=?,decided_by=? WHERE id=?", (ts, q.from_user.id, request_id))
+        conn.execute("COMMIT")
+    store.audit(q.from_user.id, "approve_key_request", f"request={request_id}; user={req['user_id']}")
+    balance = store.balance(req["user_id"])
+    try:
+        await context.bot.send_message(req["user_id"],
+            f"🎉 Chúc mừng bạn đã được admin duyệt key thành công!\n\n🔑 Mã key là: {key['key_text']}\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\nSố điểm còn: {balance} điểm",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép nhanh mã key", copy_text=CopyTextButton(text=key["key_text"]))]]))
+        await q.message.reply_text(f"✅ Đã duyệt yêu cầu #{request_id} cho ID {req['user_id']}.")
+    except TelegramError:
+        await q.message.reply_text("Đã duyệt trong hệ thống nhưng không gửi được tin nhắn cho người dùng (có thể họ đã chặn bot).")
 
 async def check_join_callback(update, context):
     q=update.callback_query
@@ -503,19 +722,69 @@ async def check_join_callback(update, context):
         buttons.append([InlineKeyboardButton("🔄 Kiểm tra lại",callback_data="checkjoin")])
         await q.message.reply_text("Bạn chưa tham gia đủ các nhóm/kênh bắt buộc.",reply_markup=InlineKeyboardMarkup(buttons))
     else:
-        # Re-run full claim checks only after membership is confirmed.
-        ok,status,key=store.claim_key(q.from_user.id)
-        if ok:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép nhanh mã key", copy_text=CopyTextButton(text=key))]])
-            await q.message.reply_text(f"🎉 Chúc mừng bạn đã đổi key thành công!\n\n🔑 Mã key là: `{key}`\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\n\n💸 Đã trừ {KEY_COST} điểm. Số dư còn: {store.balance(q.from_user.id)} điểm",parse_mode="Markdown",reply_markup=kb)
-        elif status=="INSUFFICIENT":
-            balance = store.balance(q.from_user.id)
-            missing_points = max(0, KEY_COST - balance)
-            people_needed = (missing_points + REWARD_TOKENS - 1) // REWARD_TOKENS
-            await q.message.reply_text(f"❌ Bạn còn thiếu {missing_points} điểm nữa để có thể đổi key.\nHãy mời thêm {people_needed} người nữa để nhận đủ điểm nhé!", reply_markup=main_keyboard(q.from_user.id))
-        elif status=="EMPTY":
-            await q.message.reply_text("📭 Hiện đang hết key. Vui lòng nhắn tin cho admin để thêm key: @huybuwin")
-        else: await q.message.reply_text("Không thể cấp key lúc này.")
+        await request_key_approval(q.message, context, q.from_user.id)
+
+async def send_account_card(message, target_id):
+    details = store.user_details(target_id)
+    if not details:
+        await message.reply_text("Không tìm thấy người dùng đã bắt đầu bot.")
+        return
+    user, referrals, claims, txs = details
+    username = f"@{user['username']}" if user["username"] else "Chưa đặt username"
+    text = (f"👤 THÔNG TIN TÀI KHOẢN\n"
+            f"ID: {target_id}\n"
+            f"Username: {username}\n"
+            f"Tên: {user['first_name'] or '-'}\n"
+            f"Số điểm: {user['token_balance']}\n"
+            f"Tổng lượt mời: {referrals}")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Lịch sử mời", callback_data=f"admuser:invites:{target_id}"),
+         InlineKeyboardButton("🔑 Lịch sử đổi key", callback_data=f"admuser:keys:{target_id}")],
+        [InlineKeyboardButton("➕ Cộng điểm", callback_data=f"admuser:add:{target_id}"),
+         InlineKeyboardButton("➖ Trừ điểm", callback_data=f"admuser:sub:{target_id}")],
+        [InlineKeyboardButton("🔄 Làm mới", callback_data=f"admuser:refresh:{target_id}")]
+    ])
+    await message.reply_text(text, reply_markup=kb)
+
+async def account_admin_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        await q.message.reply_text("⛔ Bạn không có quyền quản trị.")
+        return
+    try:
+        _, action, raw_id = q.data.split(":", 2)
+        target = int(raw_id)
+    except (ValueError, AttributeError):
+        await q.message.reply_text("Dữ liệu tài khoản không hợp lệ.")
+        return
+    details = store.user_details(target)
+    if not details:
+        await q.message.reply_text("Không tìm thấy tài khoản này.")
+        return
+    if action == "refresh":
+        await send_account_card(q.message, target)
+    elif action == "invites":
+        with store.connect() as conn:
+            rows = conn.execute("""SELECT r.invitee_id, u.username, u.first_name, r.created_at
+                FROM referrals r LEFT JOIN users u ON u.user_id=r.invitee_id
+                WHERE r.inviter_id=? ORDER BY r.id DESC LIMIT 50""", (target,)).fetchall()
+        lines = [f"👥 LỊCH SỬ MỜI — ID {target}"]
+        if rows:
+            lines += [f"• @{r['username']} (ID: {r['invitee_id']}) — {r['created_at']}" if r['username'] else f"• {r['first_name'] or 'Người dùng'} (ID: {r['invitee_id']}) — {r['created_at']}" for r in rows]
+        else:
+            lines.append("Chưa có lượt mời nào.")
+        await q.message.reply_text("\n".join(lines))
+    elif action == "keys":
+        _, _, claims, _ = details
+        lines = [f"🔑 LỊCH SỬ ĐỔI KEY — ID {target}"]
+        lines += [f"• {r['key_text']} — {r['claimed_at']}" for r in claims] or ["Chưa đổi key lần nào."]
+        await q.message.reply_text("\n".join(lines))
+    elif action in ("add", "sub"):
+        context.user_data["account_target_id"] = target
+        context.user_data["admin_state"] = "account_add_amount" if action == "add" else "account_sub_amount"
+        verb = "cộng" if action == "add" else "trừ"
+        await q.message.reply_text(f"Nhập số điểm cần {verb} cho ID {target} (chỉ nhập số nguyên dương). Gõ /cancel để hủy.")
 
 async def error_handler(update, context):
     log.exception("Unhandled exception", exc_info=context.error)
@@ -551,6 +820,9 @@ def build_application():
     for command in ("addchat","disablechat","enablechat","delchat"):
         app.add_handler(CommandHandler(command,chat_admin_command))
     app.add_handler(CallbackQueryHandler(verify_gate_callback, pattern=r"^verify_gate$"))
+    app.add_handler(CallbackQueryHandler(key_request_callback, pattern=r"^keyreq:(approve|reject):\d+$"))
+    app.add_handler(CallbackQueryHandler(balance_quick_callback, pattern=r"^balance:invite$"))
+    app.add_handler(CallbackQueryHandler(account_admin_callback, pattern=r"^admuser:(invites|keys|add|sub|refresh):\d+$"))
     app.add_handler(CallbackQueryHandler(admin_callback,pattern=r"^(adm:|home$)"))
     app.add_handler(CallbackQueryHandler(check_join_callback,pattern=r"^checkjoin$"))
     app.add_handler(CallbackQueryHandler(broadcast_callback,pattern=r"^broadcast:"))
