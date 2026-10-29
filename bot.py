@@ -28,7 +28,32 @@ log = logging.getLogger("token-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
+def resolve_db_path():
+    """Use the configured SQLite path when writable; fall back if Render has no /data disk."""
+    configured = os.getenv("DB_PATH", "/data/bot.db").strip() or "/data/bot.db"
+    candidates = [configured]
+    fallback = os.path.abspath("bot.db")
+    if os.path.abspath(configured) != fallback:
+        candidates.append(fallback)
+
+    for candidate in candidates:
+        try:
+            parent = os.path.dirname(os.path.abspath(candidate))
+            os.makedirs(parent, exist_ok=True)
+            # Test actual write permission before Store initializes the database.
+            probe = os.path.join(parent, f".db_write_test_{os.getpid()}")
+            with open(probe, "w", encoding="utf-8") as test_file:
+                test_file.write("ok")
+            os.remove(probe)
+            if candidate != configured:
+                log.warning("Configured DB path %s is not writable; using %s instead.", configured, candidate)
+            return candidate
+        except OSError as exc:
+            log.warning("Database path %s is not writable: %s", candidate, exc)
+
+    raise RuntimeError("Không có đường dẫn database nào ghi được. Hãy kiểm tra quyền ghi trên Render.")
+
+DB_PATH = resolve_db_path()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 BROADCAST_DELAY = 0.05
 
