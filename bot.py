@@ -48,24 +48,15 @@ with store.connect() as _conn:
         reject_reason TEXT
     )""")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_key_requests_status ON key_requests(status, id)")
-    _conn.execute("""CREATE TABLE IF NOT EXISTS invite_count_adjustments (
-        user_id INTEGER PRIMARY KEY,
-        adjustment INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL,
-        updated_by INTEGER NOT NULL
-    )""")
 
 
 def get_invite_count(user_id):
-    """Actual successful referrals plus any admin-set adjustment."""
+    """Count only real successful referrals; no admin-set invite adjustments."""
     with store.connect() as conn:
-        actual = conn.execute(
-            "SELECT COUNT(*) AS n FROM referrals WHERE inviter_id=?", (user_id,)
-        ).fetchone()["n"]
         row = conn.execute(
-            "SELECT adjustment FROM invite_count_adjustments WHERE user_id=?", (user_id,)
+            "SELECT COUNT(*) AS n FROM referrals WHERE inviter_id=?", (user_id,)
         ).fetchone()
-    return max(0, int(actual) + (int(row["adjustment"]) if row else 0))
+    return int(row["n"])
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
@@ -110,14 +101,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             store.set_pending_inviter(user.id, inviter)
     if is_admin(user.id):
         await update.effective_message.reply_text(
-            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
+            "✨ *JINNY CHEAT FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
             parse_mode="Markdown", reply_markup=main_keyboard(user.id))
         return
     # Always re-check the live required-chat list. Admins can add a new channel
     # at any time, and previously verified users must join it before continuing.
     if is_admin(user.id):
         await update.effective_message.reply_text(
-            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
+            "✨ *JINNY CHEAT FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
             parse_mode="Markdown", reply_markup=main_keyboard(user.id))
         return
     missing, error = await required_check(user.id, context)
@@ -135,7 +126,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except TelegramError:
                 pass
     await update.effective_message.reply_text(
-        "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh đủ nhóm/kênh. Chọn chức năng bên dưới.",
+        "✨ *JINNY CHEAT FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh đủ nhóm/kênh. Chọn chức năng bên dưới.",
         parse_mode="Markdown", reply_markup=main_keyboard(user.id))
 
 async def send_join_gate(message, context, user_id, chats=None):
@@ -149,7 +140,7 @@ async def send_join_gate(message, context, user_id, chats=None):
                     await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} điểm vì người được mời đã xác minh!")
                 except TelegramError:
                     pass
-        await message.reply_text("✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChọn chức năng bên dưới.",
+        await message.reply_text("✨ *JINNY CHEAT FREE KEY* ✨\n━━━━━━━━━━━━━━\nChọn chức năng bên dưới.",
                                  parse_mode="Markdown", reply_markup=main_keyboard(user_id))
         return
     buttons = [[InlineKeyboardButton(f"📢 {chat['title'][:40]}", url=chat["invite_url"])] for chat in chats]
@@ -419,39 +410,6 @@ async def admin_text(update, context):
         else:
             await send_account_card(update.effective_message, target)
         store.audit(uid,"lookup_user",str(target))
-    elif state == "account_invites_amount":
-        try:
-            desired_invites = int(text.strip())
-            if desired_invites < 0:
-                raise ValueError("Lượt mời không được âm")
-            target = int(context.user_data["account_target_id"])
-            if not store.get_user(target):
-                raise ValueError("Không tìm thấy người dùng")
-            with store.connect() as conn:
-                actual = conn.execute(
-                    "SELECT COUNT(*) AS n FROM referrals WHERE inviter_id=?", (target,)
-                ).fetchone()["n"]
-                adjustment = desired_invites - int(actual)
-                conn.execute("""INSERT INTO invite_count_adjustments(user_id, adjustment, updated_at, updated_by)
-                    VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
-                    adjustment=excluded.adjustment, updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
-                    (target, adjustment, now_iso(), uid))
-            desired_balance = desired_invites * REWARD_TOKENS
-            current_balance = store.balance(target)
-            delta = desired_balance - current_balance
-            if delta:
-                store.add_tokens(target, delta, "Admin set invite count and synchronized points", uid)
-            store.audit(uid, "set_invite_count", f"user={target}, invites={desired_invites}, balance={desired_balance}")
-            context.user_data.pop("account_target_id", None)
-            context.user_data.pop("admin_state", None)
-            await update.effective_message.reply_text(
-                f"✅ Đã cập nhật tài khoản ID {target}\n👥 Lượt mời: {desired_invites}\n💰 Số dư đã đồng bộ: {desired_balance} điểm.",
-                reply_markup=admin_keyboard())
-            await send_account_card(update.effective_message, target)
-            return True
-        except (ValueError, TypeError, KeyError) as e:
-            await update.effective_message.reply_text(f"❌ Giá trị không hợp lệ: {e}. Nhập số nguyên từ 0 trở lên hoặc /cancel.")
-            return True
     elif state in ("account_add_amount", "account_sub_amount"):
         try:
             amount = int(text.strip())
@@ -672,16 +630,15 @@ async def text_router(update, context):
     elif text == "🏆 Top 5 người mời":
         await show_top_invites(update.effective_message)
     elif text == "🆘 Hỗ trợ":
-        await update.effective_message.reply_text("Liên hệ vào thẳng vấn đề", reply_markup=main_keyboard(uid))
+        await update.effective_message.reply_text("Liên hệ vào thẳng vấn đề @huybuwin", reply_markup=main_keyboard(uid))
     elif text == "🛡 Quản trị": await admin_command(update,context)
 
 
 async def show_top_invites(message):
     with store.connect() as conn:
         rows = conn.execute("""SELECT u.user_id,u.username,u.first_name,
-            COUNT(r.id) + COALESCE(a.adjustment, 0) AS invite_count
+            COUNT(r.id) AS invite_count
             FROM users u LEFT JOIN referrals r ON r.inviter_id=u.user_id
-            LEFT JOIN invite_count_adjustments a ON a.user_id=u.user_id
             GROUP BY u.user_id ORDER BY invite_count DESC, u.user_id ASC LIMIT 5""").fetchall()
     lines = []
     for i in range(5):
@@ -795,7 +752,6 @@ async def send_account_card(message, target_id):
          InlineKeyboardButton("🔑 Lịch sử đổi key", callback_data=f"admuser:keys:{target_id}")],
         [InlineKeyboardButton("➕ Cộng điểm", callback_data=f"admuser:add:{target_id}"),
          InlineKeyboardButton("➖ Trừ điểm", callback_data=f"admuser:sub:{target_id}")],
-        [InlineKeyboardButton("👥 Sửa lượt mời + đồng bộ điểm", callback_data=f"admuser:setinvites:{target_id}")],
         [InlineKeyboardButton("🔄 Làm mới", callback_data=f"admuser:refresh:{target_id}")]
     ])
     await message.reply_text(text, reply_markup=kb)
@@ -839,12 +795,6 @@ async def account_admin_callback(update, context):
         context.user_data["admin_state"] = "account_add_amount" if action == "add" else "account_sub_amount"
         verb = "cộng" if action == "add" else "trừ"
         await q.message.reply_text(f"Nhập số điểm cần {verb} cho ID {target} (chỉ nhập số nguyên dương). Gõ /cancel để hủy.")
-    elif action == "setinvites":
-        context.user_data["account_target_id"] = target
-        context.user_data["admin_state"] = "account_invites_amount"
-        await q.message.reply_text(
-            f"Nhập tổng lượt mời muốn đặt cho ID {target}. Ví dụ nhập 4 sẽ đặt lượt mời là 4 và đồng bộ số dư thành {4 * REWARD_TOKENS} điểm (theo mức {REWARD_TOKENS} điểm/lượt). Gõ /cancel để hủy."
-        )
 
 async def error_handler(update, context):
     log.exception("Unhandled exception", exc_info=context.error)
@@ -882,7 +832,7 @@ def build_application():
     app.add_handler(CallbackQueryHandler(verify_gate_callback, pattern=r"^verify_gate$"))
     app.add_handler(CallbackQueryHandler(key_request_callback, pattern=r"^keyreq:(approve|reject):\d+$"))
     app.add_handler(CallbackQueryHandler(balance_quick_callback, pattern=r"^balance:invite$"))
-    app.add_handler(CallbackQueryHandler(account_admin_callback, pattern=r"^admuser:(invites|keys|add|sub|refresh|setinvites):\d+$"))
+    app.add_handler(CallbackQueryHandler(account_admin_callback, pattern=r"^admuser:(invites|keys|add|sub|refresh):\d+$"))
     app.add_handler(CallbackQueryHandler(admin_callback,pattern=r"^(adm:|home$)"))
     app.add_handler(CallbackQueryHandler(check_join_callback,pattern=r"^checkjoin$"))
     app.add_handler(CallbackQueryHandler(broadcast_callback,pattern=r"^broadcast:"))

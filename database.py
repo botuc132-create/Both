@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 REWARD_TOKENS = 10
-KEY_COST = 30
+KEY_COST = 40
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 def now_iso():
