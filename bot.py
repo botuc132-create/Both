@@ -4,7 +4,7 @@ import sqlite3
 import asyncio
 from aiohttp import web
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from telegram import (
@@ -40,10 +40,9 @@ def is_admin(user_id):
 
 def main_keyboard(user_id):
     rows = [
-        [KeyboardButton("🎁 Nhận key"), KeyboardButton("👥 Giới thiệu")],
-        [KeyboardButton("💰 Số dư Token"), KeyboardButton("🗃 Kho key")],
-        [KeyboardButton("⬇️ Tải hack")],
-        [KeyboardButton("ℹ️ Hướng dẫn")]
+        [KeyboardButton("🔑 Đổi key"), KeyboardButton("👥 Giới thiệu")],
+        [KeyboardButton("💰 Số dư điểm"), KeyboardButton("🗃 Kho key")],
+        [KeyboardButton("📨 Mời bạn bè"), KeyboardButton("🆘 Hỗ trợ")]
     ]
     if is_admin(user_id):
         rows.append([KeyboardButton("🛡 Quản trị")])
@@ -55,7 +54,7 @@ def admin_keyboard():
          InlineKeyboardButton("📦 Thống kê kho", callback_data="adm:keys")],
         [InlineKeyboardButton("👤 Tổng người dùng", callback_data="adm:users"),
          InlineKeyboardButton("🔎 Tra cứu ID", callback_data="adm:lookup")],
-        [InlineKeyboardButton("🪙 Cộng/trừ Token", callback_data="adm:tokens"),
+        [InlineKeyboardButton("🪙 Cộng/trừ điểm", callback_data="adm:tokens"),
          InlineKeyboardButton("📣 Phát thông báo", callback_data="adm:broadcast")],
         [InlineKeyboardButton("🔗 Nhóm/kênh bắt buộc", callback_data="adm:chats")],
         [InlineKeyboardButton("📊 Thống kê", callback_data="adm:stats"),
@@ -81,29 +80,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
             parse_mode="Markdown", reply_markup=main_keyboard(user.id))
         return
-    if store.user_verified(user.id):
+    # Always re-check the live required-chat list. Admins can add a new channel
+    # at any time, and previously verified users must join it before continuing.
+    if is_admin(user.id):
         await update.effective_message.reply_text(
-            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh thành công. Chọn chức năng bên dưới.",
+            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
             parse_mode="Markdown", reply_markup=main_keyboard(user.id))
         return
-    await send_join_gate(update.effective_message, context, user.id)
-
-async def send_join_gate(message, context, user_id):
-    chats = store.required_chats()
-    if not chats:
-        _, inviter = store.verify_user_and_reward(user_id)
-        await message.reply_text("✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChọn chức năng bên dưới.",
-                                 parse_mode="Markdown", reply_markup=main_keyboard(user_id))
+    missing, error = await required_check(user.id, context)
+    if error:
+        await update.effective_message.reply_text("⚠️ Chưa thể xác minh thành viên. Vui lòng thử lại sau.")
+        return
+    if missing:
+        await send_join_gate(update.effective_message, context, user.id, missing)
+        return
+    if not store.user_verified(user.id):
+        _, inviter = store.verify_user_and_reward(user.id)
         if inviter:
             try:
-                await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} Token vì người được mời đã xác minh!")
+                await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} điểm vì người được mời đã xác minh!")
             except TelegramError:
                 pass
+    await update.effective_message.reply_text(
+        "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh đủ nhóm/kênh. Chọn chức năng bên dưới.",
+        parse_mode="Markdown", reply_markup=main_keyboard(user.id))
+
+async def send_join_gate(message, context, user_id, chats=None):
+    if chats is None:
+        chats = store.required_chats()
+    if not chats:
+        if not store.user_verified(user_id):
+            _, inviter = store.verify_user_and_reward(user_id)
+            if inviter:
+                try:
+                    await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} điểm vì người được mời đã xác minh!")
+                except TelegramError:
+                    pass
+        await message.reply_text("✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChọn chức năng bên dưới.",
+                                 parse_mode="Markdown", reply_markup=main_keyboard(user_id))
         return
-    buttons = [[InlineKeyboardButton(f"📢 JOIN CHANNEL {i}", url=chat["invite_url"])] for i, chat in enumerate(chats, 1)]
+    buttons = [[InlineKeyboardButton(f"📢 {chat['title'][:40]}", url=chat["invite_url"])] for chat in chats]
     buttons.append([InlineKeyboardButton("✅ VERIFY", callback_data="verify_gate")])
     await message.reply_text(
-        "🚫 *ACCESS DENIED!*\n\nYou must join our official channels to use this bot.\n\n👇 Join below and click ✅ *VERIFY*.",
+        "🚫 *ACCESS DENIED!*\n\nBạn cần tham gia các nhóm/kênh bên dưới để tiếp tục sử dụng bot.\n\n👇 Tham gia xong hãy bấm ✅ *VERIFY*.",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def verify_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,18 +134,18 @@ async def verify_gate_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     missing, error = await required_check(uid, context)
     if error:
-        await q.message.reply_text("⚠️ Không thể xác minh lúc này. Chưa mở khóa bot; hãy thử lại sau.")
+        await q.message.reply_text("⚠️ Không thể xác minh lúc này. Bot vẫn bị khóa; hãy thử lại sau.")
         return
     if missing:
-        buttons = [[InlineKeyboardButton(f"📢 JOIN CHANNEL {i}", url=chat["invite_url"])] for i, chat in enumerate(missing, 1)]
-        buttons.append([InlineKeyboardButton("✅ VERIFY", callback_data="verify_gate")])
-        await q.message.reply_text("🚫 ACCESS DENIED! Bạn chưa tham gia đủ tất cả nhóm/kênh. Hãy tham gia rồi bấm VERIFY.", reply_markup=InlineKeyboardMarkup(buttons))
+        await send_join_gate(q.message, context, uid, missing)
         return
-    _, inviter = store.verify_user_and_reward(uid)
-    await q.message.reply_text("✅ XÁC MINH THÀNH CÔNG! Bạn đã được mở khóa bot.", reply_markup=main_keyboard(uid))
+    inviter = None
+    if not store.user_verified(uid):
+        _, inviter = store.verify_user_and_reward(uid)
+    await q.message.reply_text("✅ XÁC MINH THÀNH CÔNG! Bạn đã tham gia đủ các nhóm/kênh hiện được yêu cầu.", reply_markup=main_keyboard(uid))
     if inviter:
         try:
-            await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} Token vì người được mời đã tham gia đủ kênh và xác minh thành công!")
+            await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} điểm vì người được mời đã tham gia đủ kênh và xác minh thành công!")
         except TelegramError:
             pass
 
@@ -137,7 +156,7 @@ async def show_referral(update, context):
     details = store.user_details(uid)
     count = details[1] if details else 0
     await update.effective_message.reply_text(
-        f"👥 *GIỚI THIỆU BẠN BÈ*\n━━━━━━━━━━━━━━\n🔗 Liên kết của bạn:\n`{link}`\n\n✅ Lượt mời thành công: *{count}*\n💰 Số dư: *{store.balance(uid)} Token*\n🎁 Mỗi người mới hợp lệ mang lại {REWARD_TOKENS} Token.",
+        f"👥 *GIỚI THIỆU BẠN BÈ*\n━━━━━━━━━━━━━━\n🔗 Liên kết của bạn:\n`{link}`\n\n✅ Lượt mời thành công: *{count}*\n💰 Số dư: *{store.balance(uid)} điểm*\n🎁 Mỗi người mới hợp lệ mang lại {REWARD_TOKENS} điểm.",
         parse_mode="Markdown", reply_markup=main_keyboard(uid))
 
 async def required_check(user_id, context):
@@ -168,10 +187,15 @@ async def receive_key(update, context):
     if ok:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép nhanh mã key", copy_text=CopyTextButton(text=key))]])
         await update.effective_message.reply_text(
-            f"🎉 Chúc mừng bạn đã đổi key thành công!\n\n🔑 Mã key là: `{key}`\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\n\n💸 Đã trừ {KEY_COST} Token. Số dư còn: {store.balance(uid)} Token",
+            f"🎉 Chúc mừng bạn đã đổi key thành công!\n\n🔑 Mã key là: `{key}`\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\n\n💸 Đã trừ {KEY_COST} điểm. Số dư còn: {store.balance(uid)} điểm",
             parse_mode="Markdown", reply_markup=kb)
     elif status == "INSUFFICIENT":
-        await update.effective_message.reply_text(f"❌ Bạn cần {KEY_COST} Token để nhận key. Số dư hiện tại: {store.balance(uid)} Token.\nMời bạn bè để nhận thêm Token.", reply_markup=main_keyboard(uid))
+        balance = store.balance(uid)
+        missing_points = max(0, KEY_COST - balance)
+        people_needed = (missing_points + REWARD_TOKENS - 1) // REWARD_TOKENS
+        await update.effective_message.reply_text(
+            f"❌ Bạn còn thiếu {missing_points} điểm nữa để có thể đổi key.\nHãy mời thêm {people_needed} người nữa để nhận đủ điểm nhé!",
+            reply_markup=main_keyboard(uid))
     elif status == "EMPTY":
         await update.effective_message.reply_text("📭 Hiện đang hết key. Vui lòng nhắn tin cho admin để thêm key: @huybuwin", reply_markup=main_keyboard(uid))
     else:
@@ -204,7 +228,7 @@ async def admin_callback(update, context):
             tokens=c.execute("SELECT COALESCE(SUM(token_balance),0) n FROM users").fetchone()["n"]
             refs=c.execute("SELECT COUNT(*) n FROM referrals").fetchone()["n"]
             claims=c.execute("SELECT COUNT(*) n FROM key_claims").fetchone()["n"]
-        await q.edit_message_text(f"📊 *THỐNG KÊ*\nNgười dùng: {store.users_count()}\nLượt giới thiệu: {refs}\nTổng Token đang lưu: {tokens}\nKey còn/đã cấp/tổng: {s['available']}/{s['claimed']}/{s['total']}\nLượt nhận key: {claims}", parse_mode="Markdown", reply_markup=admin_keyboard())
+        await q.edit_message_text(f"📊 *THỐNG KÊ*\nNgười dùng: {store.users_count()}\nLượt giới thiệu: {refs}\nTổng điểm đang lưu: {tokens}\nKey còn/đã cấp/tổng: {s['available']}/{s['claimed']}/{s['total']}\nLượt nhận key: {claims}", parse_mode="Markdown", reply_markup=admin_keyboard())
     elif action == "adm:addkeys":
         context.user_data["admin_state"] = "addkeys"
         await q.edit_message_text("Gửi các key, mỗi dòng một bản ghi. Dòng trùng vẫn được lưu riêng.\nGõ /cancel để hủy.")
@@ -213,7 +237,7 @@ async def admin_callback(update, context):
         await q.edit_message_text("Gửi Telegram ID người dùng cần tra cứu. /cancel để hủy.")
     elif action == "adm:tokens":
         context.user_data["admin_state"] = "tokens_user"
-        await q.edit_message_text("Nhập Telegram ID của người cần cộng/trừ Token. /cancel để hủy.")
+        await q.edit_message_text("Nhập Telegram ID của người cần cộng/trừ điểm. /cancel để hủy.")
     elif action == "adm:broadcast":
         context.user_data["admin_state"] = "broadcast"
         await q.edit_message_text("Gửi nội dung thông báo cho người đã /start bot. Sau đó bot sẽ yêu cầu xác nhận.\n/cancel để hủy.")
@@ -314,8 +338,8 @@ async def admin_text(update, context):
         else:
             u, refs, claims, txs=d
             claim_text="\n".join(f"• {x['key_text']} ({x['claimed_at']})" for x in claims) or "Chưa nhận key"
-            tx_text="\n".join(f"• {x['amount']:+} → {x['balance_after']} Token: {x['reason']}" for x in txs) or "Chưa có giao dịch"
-            await update.effective_message.reply_text(f"👤 ID: {target}\nTên: {u['first_name']}\nUsername: @{u['username'] or '-'}\nSố dư: {u['token_balance']} Token\nGiới thiệu: {refs}\n\n🔑 Key đã cấp gần đây:\n{claim_text}\n\n🪙 Giao dịch gần đây:\n{tx_text}")
+            tx_text="\n".join(f"• {x['amount']:+} → {x['balance_after']} điểm: {x['reason']}" for x in txs) or "Chưa có giao dịch"
+            await update.effective_message.reply_text(f"👤 ID: {target}\nTên: {u['first_name']}\nUsername: @{u['username'] or '-'}\nSố dư: {u['token_balance']} điểm\nGiới thiệu: {refs}\n\n🔑 Key đã cấp gần đây:\n{claim_text}\n\n🪙 Giao dịch gần đây:\n{tx_text}")
         store.audit(uid,"lookup_user",str(target))
     elif state == "tokens_user":
         try:
@@ -325,7 +349,7 @@ async def admin_text(update, context):
                 return True
             context.user_data["token_target_id"] = target
             context.user_data["admin_state"] = "tokens_amount"
-            await update.effective_message.reply_text(f"Nhập số Token cho ID {target}. Dùng số dương để cộng, số âm để trừ. Ví dụ: 50 hoặc -30.")
+            await update.effective_message.reply_text(f"Nhập số điểm cho ID {target}. Dùng số dương để cộng, số âm để trừ. Ví dụ: 50 hoặc -30.")
             return True
         except ValueError:
             await update.effective_message.reply_text("ID không hợp lệ. Hãy nhập Telegram ID dạng số hoặc /cancel.")
@@ -336,7 +360,7 @@ async def admin_text(update, context):
             target = int(context.user_data.get("token_target_id"))
             balance = store.add_tokens(target, amount, "Admin adjustment", uid)
             store.audit(uid, "adjust_tokens", f"user={target}, amount={amount}, balance={balance}")
-            await update.effective_message.reply_text(f"✅ Đã {'cộng' if amount > 0 else 'trừ'} {abs(amount)} Token cho ID {target}. Số dư mới: {balance} Token.", reply_markup=admin_keyboard())
+            await update.effective_message.reply_text(f"✅ Đã {'cộng' if amount > 0 else 'trừ'} {abs(amount)} điểm cho ID {target}. Số dư mới: {balance} điểm.", reply_markup=admin_keyboard())
             context.user_data.pop("token_target_id", None)
         except (ValueError, TypeError) as e:
             await update.effective_message.reply_text(f"❌ Không thực hiện được: {e}. Nhập số nguyên khác 0 hoặc /cancel.")
@@ -413,32 +437,64 @@ async def text_router(update, context):
     text=update.effective_message.text or ""
     if await admin_text(update,context): return
     uid=update.effective_user.id
-    if not is_admin(uid) and not store.user_verified(uid):
-        await send_join_gate(update.effective_message, context, uid)
-        return
-    if text == "🎁 Nhận key": await receive_key(update,context)
+    if not is_admin(uid):
+        missing, error = await required_check(uid, context)
+        if error:
+            await update.effective_message.reply_text("⚠️ Không thể xác minh thành viên lúc này. Vui lòng thử lại sau; bot tạm thời bị khóa.")
+            return
+        if missing:
+            await send_join_gate(update.effective_message, context, uid, missing)
+            return
+        if not store.user_verified(uid):
+            _, inviter = store.verify_user_and_reward(uid)
+            if inviter:
+                try:
+                    await context.bot.send_message(inviter, f"🎉 Bạn được cộng {REWARD_TOKENS} điểm vì người được mời đã xác minh!")
+                except TelegramError:
+                    pass
+    if text == "🔑 Đổi key": await receive_key(update,context)
     elif text == "👥 Giới thiệu": await show_referral(update,context)
-    elif text == "💰 Số dư Token":
-        await update.effective_message.reply_text(f"💰 Số dư hiện tại: *{store.balance(uid)} Token*",parse_mode="Markdown",reply_markup=main_keyboard(uid))
+    elif text == "💰 Số dư điểm":
+        details = store.user_details(uid)
+        total_invites = int(details[1]) if details else 0
+        # Referral timestamps are stored in UTC ISO format; convert the local
+        # Vietnam calendar day to UTC boundaries for an accurate daily count.
+        from zoneinfo import ZoneInfo
+        now_local = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+        start_utc = now_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat(timespec="seconds")
+        end_utc = (now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc).isoformat(timespec="seconds")
+        with store.connect() as conn:
+            today_invites = conn.execute("SELECT COUNT(*) n FROM referrals WHERE inviter_id=? AND created_at>=? AND created_at<?", (uid, start_utc, end_utc)).fetchone()["n"]
+        balance_text = (
+            f"Số điểm của bạn có: {store.balance(uid)}\n"
+            f"ID người dùng: `{uid}`\n"
+            "-----------------\n"
+            f"Tổng lượt mời: {total_invites}\n"
+            f"Lượt mời hôm nay: {today_invites}\n"
+            "------------------"
+        )
+        copy_id_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 Sao chép ID", copy_text=CopyTextButton(text=str(uid)))
+        ]])
+        await update.effective_message.reply_text(
+            balance_text,
+            parse_mode="Markdown",
+            reply_markup=copy_id_kb
+        )
     elif text == "🗃 Kho key":
         s=store.key_stats()
         await update.effective_message.reply_text(f"🗃 *TRẠNG THÁI KHO*\nKey còn: {s['available']}\nKey đã cấp: {s['claimed']}\nTổng: {s['total']}",parse_mode="Markdown",reply_markup=main_keyboard(uid))
-    elif text == "⬇️ Tải hack":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Bấm vào đây ✅", url="https://link4sub.com/HRpFZdcmMs")]])
-        await update.effective_message.reply_text(
-            "⬇️ *TẢI HACK*\n\nBấm vào đây để tải:",
-            parse_mode="Markdown", reply_markup=kb)
+    elif text == "📨 Mời bạn bè":
+        username = BOT_USERNAME or (await context.bot.get_me()).username
+        link = f"https://t.me/{username}?start=ref_{uid}"
+        await update.effective_message.reply_text(f"🔗 Link mời bạn bè của bạn:\n{link}\n\nMỗi người mới hợp lệ tham gia đủ nhóm và xác minh sẽ giúp bạn nhận {REWARD_TOKENS} điểm.", reply_markup=main_keyboard(uid))
+    elif text == "🆘 Hỗ trợ":
+        await update.effective_message.reply_text("Liên hệ vào thẳng vấn đề", reply_markup=main_keyboard(uid))
     elif text == "🛡 Quản trị": await admin_command(update,context)
-    elif text == "ℹ️ Hướng dẫn":
-        await update.effective_message.reply_text(f"🎁 Nhận key: {KEY_COST} Token\n👥 Giới thiệu người mới: +{REWARD_TOKENS} Token\nDùng /start để mở menu.",reply_markup=main_keyboard(uid))
 
 async def check_join_callback(update, context):
     q=update.callback_query
     await q.answer()
-    if not is_admin(q.from_user.id) and not store.user_verified(q.from_user.id):
-        await q.message.reply_text("🚫 Bạn cần xác minh đầy đủ nhóm/kênh trước khi sử dụng bot.")
-        await send_join_gate(q.message, context, q.from_user.id)
-        return
     missing,error=await required_check(q.from_user.id,context)
     if error:
         await q.message.reply_text("⚠️ "+error); return
@@ -451,9 +507,12 @@ async def check_join_callback(update, context):
         ok,status,key=store.claim_key(q.from_user.id)
         if ok:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("📋 Sao chép nhanh mã key", copy_text=CopyTextButton(text=key))]])
-            await q.message.reply_text(f"🎉 Chúc mừng bạn đã đổi key thành công!\n\n🔑 Mã key là: `{key}`\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\n\n💸 Đã trừ {KEY_COST} Token. Số dư còn: {store.balance(q.from_user.id)} Token",parse_mode="Markdown",reply_markup=kb)
+            await q.message.reply_text(f"🎉 Chúc mừng bạn đã đổi key thành công!\n\n🔑 Mã key là: `{key}`\n\nHãy mời bạn bè để nhận thêm nhiều key nhé!\n\n💸 Đã trừ {KEY_COST} điểm. Số dư còn: {store.balance(q.from_user.id)} điểm",parse_mode="Markdown",reply_markup=kb)
         elif status=="INSUFFICIENT":
-            await q.message.reply_text(f"Bạn cần {KEY_COST} Token; hiện có {store.balance(q.from_user.id)}.")
+            balance = store.balance(q.from_user.id)
+            missing_points = max(0, KEY_COST - balance)
+            people_needed = (missing_points + REWARD_TOKENS - 1) // REWARD_TOKENS
+            await q.message.reply_text(f"❌ Bạn còn thiếu {missing_points} điểm nữa để có thể đổi key.\nHãy mời thêm {people_needed} người nữa để nhận đủ điểm nhé!", reply_markup=main_keyboard(q.from_user.id))
         elif status=="EMPTY":
             await q.message.reply_text("📭 Hiện đang hết key. Vui lòng nhắn tin cho admin để thêm key: @huybuwin")
         else: await q.message.reply_text("Không thể cấp key lúc này.")
