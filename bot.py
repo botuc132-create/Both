@@ -78,12 +78,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             store.set_pending_inviter(user.id, inviter)
     if is_admin(user.id):
         await update.effective_message.reply_text(
-            "✨ *SX2 TEAM FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
+            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\nChào mừng quản trị viên! Chọn chức năng bên dưới.",
             parse_mode="Markdown", reply_markup=main_keyboard(user.id))
         return
     if store.user_verified(user.id):
         await update.effective_message.reply_text(
-            "✨ *SX2 TEAM FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh thành công. Chọn chức năng bên dưới.",
+            "✨ *ZEXTRON FREE KEY* ✨\n━━━━━━━━━━━━━━\n✅ Bạn đã xác minh thành công. Chọn chức năng bên dưới.",
             parse_mode="Markdown", reply_markup=main_keyboard(user.id))
         return
     await send_join_gate(update.effective_message, context, user.id)
