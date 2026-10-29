@@ -28,12 +28,12 @@ log = logging.getLogger("token-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 BROADCAST_DELAY = 0.05
 
 
-store = Store()
+store = Store(DB_PATH)
 # Key requests wait for admin approval; points are held until the request is decided.
 with store.connect() as _conn:
     _conn.execute("""CREATE TABLE IF NOT EXISTS key_requests (
@@ -48,6 +48,24 @@ with store.connect() as _conn:
         reject_reason TEXT
     )""")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_key_requests_status ON key_requests(status, id)")
+    _conn.execute("""CREATE TABLE IF NOT EXISTS invite_count_adjustments (
+        user_id INTEGER PRIMARY KEY,
+        adjustment INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER NOT NULL
+    )""")
+
+
+def get_invite_count(user_id):
+    """Actual successful referrals plus any admin-set adjustment."""
+    with store.connect() as conn:
+        actual = conn.execute(
+            "SELECT COUNT(*) AS n FROM referrals WHERE inviter_id=?", (user_id,)
+        ).fetchone()["n"]
+        row = conn.execute(
+            "SELECT adjustment FROM invite_count_adjustments WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return max(0, int(actual) + (int(row["adjustment"]) if row else 0))
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
@@ -171,7 +189,7 @@ async def show_referral(update, context):
     details = store.user_details(uid)
     count = details[1] if details else 0
     await update.effective_message.reply_text(
-        f"👥 *GIỚI THIỆU BẠN BÈ*\n━━━━━━━━━━━━━━\n🔗 Liên kết của bạn:\n`{link}`\n\n✅ Lượt mời thành công: *{count}*\n💰 Số dư: *{store.balance(uid)} điểm*\n🎁 Mỗi người mới hợp lệ mang lại {REWARD_TOKENS} điểm.",
+        f"👥 *GIỚI THIỆU BẠN BÈ*\n━━━━━━━━━━━━━━\n🔗 Liên kết của bạn:\n`{link}`\n\n✅ Lượt mời thành công: *{get_invite_count(uid)}*\n💰 Số dư: *{store.balance(uid)} điểm*\n🎁 Mỗi người mới hợp lệ mang lại {REWARD_TOKENS} điểm.",
         parse_mode="Markdown", reply_markup=main_keyboard(uid))
 
 async def required_check(user_id, context):
@@ -401,6 +419,39 @@ async def admin_text(update, context):
         else:
             await send_account_card(update.effective_message, target)
         store.audit(uid,"lookup_user",str(target))
+    elif state == "account_invites_amount":
+        try:
+            desired_invites = int(text.strip())
+            if desired_invites < 0:
+                raise ValueError("Lượt mời không được âm")
+            target = int(context.user_data["account_target_id"])
+            if not store.get_user(target):
+                raise ValueError("Không tìm thấy người dùng")
+            with store.connect() as conn:
+                actual = conn.execute(
+                    "SELECT COUNT(*) AS n FROM referrals WHERE inviter_id=?", (target,)
+                ).fetchone()["n"]
+                adjustment = desired_invites - int(actual)
+                conn.execute("""INSERT INTO invite_count_adjustments(user_id, adjustment, updated_at, updated_by)
+                    VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                    adjustment=excluded.adjustment, updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
+                    (target, adjustment, now_iso(), uid))
+            desired_balance = desired_invites * REWARD_TOKENS
+            current_balance = store.balance(target)
+            delta = desired_balance - current_balance
+            if delta:
+                store.add_tokens(target, delta, "Admin set invite count and synchronized points", uid)
+            store.audit(uid, "set_invite_count", f"user={target}, invites={desired_invites}, balance={desired_balance}")
+            context.user_data.pop("account_target_id", None)
+            context.user_data.pop("admin_state", None)
+            await update.effective_message.reply_text(
+                f"✅ Đã cập nhật tài khoản ID {target}\n👥 Lượt mời: {desired_invites}\n💰 Số dư đã đồng bộ: {desired_balance} điểm.",
+                reply_markup=admin_keyboard())
+            await send_account_card(update.effective_message, target)
+            return True
+        except (ValueError, TypeError, KeyError) as e:
+            await update.effective_message.reply_text(f"❌ Giá trị không hợp lệ: {e}. Nhập số nguyên từ 0 trở lên hoặc /cancel.")
+            return True
     elif state in ("account_add_amount", "account_sub_amount"):
         try:
             amount = int(text.strip())
@@ -562,7 +613,7 @@ async def text_router(update, context):
     if text == "🔑 Đổi key": await receive_key(update,context)
     elif text == "💰 Số dư điểm":
         details = store.user_details(uid)
-        total_invites = int(details[1]) if details else 0
+        total_invites = get_invite_count(uid) if details else 0
         # Referral timestamps are stored in UTC ISO format; convert the local
         # Vietnam calendar day to UTC boundaries for an accurate daily count.
         from zoneinfo import ZoneInfo
@@ -627,8 +678,10 @@ async def text_router(update, context):
 
 async def show_top_invites(message):
     with store.connect() as conn:
-        rows = conn.execute("""SELECT u.user_id,u.username,u.first_name,COUNT(r.id) AS invite_count
+        rows = conn.execute("""SELECT u.user_id,u.username,u.first_name,
+            COUNT(r.id) + COALESCE(a.adjustment, 0) AS invite_count
             FROM users u LEFT JOIN referrals r ON r.inviter_id=u.user_id
+            LEFT JOIN invite_count_adjustments a ON a.user_id=u.user_id
             GROUP BY u.user_id ORDER BY invite_count DESC, u.user_id ASC LIMIT 5""").fetchall()
     lines = []
     for i in range(5):
@@ -736,12 +789,13 @@ async def send_account_card(message, target_id):
             f"Username: {username}\n"
             f"Tên: {user['first_name'] or '-'}\n"
             f"Số điểm: {user['token_balance']}\n"
-            f"Tổng lượt mời: {referrals}")
+            f"Tổng lượt mời: {get_invite_count(target_id)}")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 Lịch sử mời", callback_data=f"admuser:invites:{target_id}"),
          InlineKeyboardButton("🔑 Lịch sử đổi key", callback_data=f"admuser:keys:{target_id}")],
         [InlineKeyboardButton("➕ Cộng điểm", callback_data=f"admuser:add:{target_id}"),
          InlineKeyboardButton("➖ Trừ điểm", callback_data=f"admuser:sub:{target_id}")],
+        [InlineKeyboardButton("👥 Sửa lượt mời + đồng bộ điểm", callback_data=f"admuser:setinvites:{target_id}")],
         [InlineKeyboardButton("🔄 Làm mới", callback_data=f"admuser:refresh:{target_id}")]
     ])
     await message.reply_text(text, reply_markup=kb)
@@ -785,6 +839,12 @@ async def account_admin_callback(update, context):
         context.user_data["admin_state"] = "account_add_amount" if action == "add" else "account_sub_amount"
         verb = "cộng" if action == "add" else "trừ"
         await q.message.reply_text(f"Nhập số điểm cần {verb} cho ID {target} (chỉ nhập số nguyên dương). Gõ /cancel để hủy.")
+    elif action == "setinvites":
+        context.user_data["account_target_id"] = target
+        context.user_data["admin_state"] = "account_invites_amount"
+        await q.message.reply_text(
+            f"Nhập tổng lượt mời muốn đặt cho ID {target}. Ví dụ nhập 4 sẽ đặt lượt mời là 4 và đồng bộ số dư thành {4 * REWARD_TOKENS} điểm (theo mức {REWARD_TOKENS} điểm/lượt). Gõ /cancel để hủy."
+        )
 
 async def error_handler(update, context):
     log.exception("Unhandled exception", exc_info=context.error)
@@ -822,7 +882,7 @@ def build_application():
     app.add_handler(CallbackQueryHandler(verify_gate_callback, pattern=r"^verify_gate$"))
     app.add_handler(CallbackQueryHandler(key_request_callback, pattern=r"^keyreq:(approve|reject):\d+$"))
     app.add_handler(CallbackQueryHandler(balance_quick_callback, pattern=r"^balance:invite$"))
-    app.add_handler(CallbackQueryHandler(account_admin_callback, pattern=r"^admuser:(invites|keys|add|sub|refresh):\d+$"))
+    app.add_handler(CallbackQueryHandler(account_admin_callback, pattern=r"^admuser:(invites|keys|add|sub|refresh|setinvites):\d+$"))
     app.add_handler(CallbackQueryHandler(admin_callback,pattern=r"^(adm:|home$)"))
     app.add_handler(CallbackQueryHandler(check_join_callback,pattern=r"^checkjoin$"))
     app.add_handler(CallbackQueryHandler(broadcast_callback,pattern=r"^broadcast:"))
